@@ -18,6 +18,11 @@ protocol fidelity, then add harness-oriented defaults and fault tolerance.
 
 Not for Gemma 2/3 or Qwen2.5 — those use different chat protocols.
 
+The Gemma 4 template is based on Google’s official **Gemma 4 260709**
+canonical chat template (published 2026-07-09; tool-calling loops, turn
+closures, and thinking content-ordering), then further optimized for
+agentic multi-turn tool use.
+
 ## Design principles
 
 1. **Accuracy first** — rendered prompts match what each family was trained on.
