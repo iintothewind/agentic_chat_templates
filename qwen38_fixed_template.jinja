@@ -1,24 +1,26 @@
 {#---------------------------------------------------------------------
-   qwen_fixed_template.jinja
+   qwen38_fixed_template.jinja
    =====================================
-   Agent-friendly fork of Qwen chat templates, tuned for open-source
+   Agent-friendly fork of Qwen 3.8 chat templates, tuned for open-source
    coding harnesses (opencode, pi, LM Studio, vLLM, SGLang).
 
    TARGET MODELS
    -------------
-   Qwen3.5 family (e.g. Qwen3.5-27B, Qwen3.5-35B-A3B, Qwen3.5-Flash)
-   Qwen3.6 family (e.g. Qwen3.6-27B, Qwen3.6-35B-A3B, Qwen3-Coder-Next)
-   Thinking / Instruct / Coder / VL variants that ship the Qwen3 chat
-   protocol (<|im_start|>, <think>, <tool_call>/<parameter>).
+   Qwen3.8 family (e.g. Qwen3.8-27B, Qwen3.8-2.4T-A95B)
+   Thinking / Instruct / Coder / VL variants that ship the Qwen3.8 chat
+   protocol (<|im_start|>, <think>, <tool_call>/<parameter>, plus native
+   reasoning_effort steering).
+   Not intended for Qwen3.5 / 3.6 — use qwen36_fixed_template.jinja.
    Not intended for Qwen2.5 or pre-3.5 models (different chat protocols).
 
    DESIGN PRINCIPLES
    -----------------
    1. Accuracy first — output must match the format each model family
-      was trained on (official Qwen3.5/3.6 XML tool + thinking blocks).
+      was trained on (official Qwen3.8 XML tool + thinking blocks +
+      reasoning_effort system instructions).
    2. Fault tolerance second — accept messy harness inputs (string
-      arguments, developer role, malformed thinking tags) and render
-      valid prompts; avoid silent corruption over blind fail-fast.
+      arguments, developer role, malformed thinking tags, effort aliases)
+      and render valid prompts; avoid silent corruption over blind fail-fast.
    3. Agent smoothness — defaults tuned for multi-turn tool loops:
       preserve historical reasoning, inject tool-error guidance, rescue
       unclosed think blocks; kwargs can restore upstream parity.
@@ -28,6 +30,7 @@
 
    PATCH INVENTORY
    ---------------
+   Inherited from qwen36_fixed_template.jinja:
    Q1  preserve_thinking defaults ON when kwarg omitted (agent-friendly;
        mitigates multi-turn tool arguments:{} collapse — pi #3325).
    Q2  developer role accepted as alias for system.
@@ -40,37 +43,57 @@
    Q7  kwargs: verbose_tool_instructions, unwrap_tool_envelope,
        strict_tool_arguments, parse_string_arguments, inject_tool_error_warnings
 
+   Qwen 3.8 native (this file):
+   Q8  reasoning_effort steering (official Qwen3.8 protocol).
+       chat_template_kwargs.reasoning_effort:
+         low    (default)  injects the official brief-reasoning instruction
+         medium            no extra instruction (neutral baseline)
+         xhigh             injects the official deep-reasoning instruction
+         none / off        disable thinking (same as enable_thinking=false)
+       Harness aliases (do not 500): high/max → xhigh, minimal → low.
+       Unknown values still raise, matching official validation.
+       Prompt-level tokens (stripped, never tokenized):
+         <|think_low|> / <|think_medium|> / <|think_xhigh|>
+         aliases: <|think_high|> → xhigh, <|think_minimal|> → low
+       Injection uses the final request state (kwargs, then last system/user
+       control token). enable_thinking=false / <|think_off|> suppress the
+       instruction. Unlike official 3.8, disabling thinking is supported.
+
    chat_template_kwargs defaults (agent-friendly):
-     enable_thinking=true, preserve_thinking=undefined (→ preserve all),
+     enable_thinking=true, reasoning_effort=low (official 3.8 default is xhigh),
+     preserve_thinking=undefined (→ preserve all),
      unwrap_tool_envelope=true, inject_tool_error_warnings=true
 
-   preserve_thinking vs official Qwen3.6 API
+   preserve_thinking vs official Qwen3.8 API
    -----------------------------------------
+     official 3.8 already defaults preserve_thinking=true.
      this template (kwarg omitted)  ≈  official preserve_thinking=true
      preserve_thinking=true           ≈  official preserve_thinking=true
-     preserve_thinking=false          ≈  official kwarg omitted (rolling
-                                        checkpoint via last_query_index)
+     preserve_thinking=false          ≈  rolling checkpoint via last_query_index
 
    UPSTREAM PARITY (chat_template_kwargs)
    --------------------------------------
      {"enable_thinking": true,
-      "preserve_thinking": false,
+      "reasoning_effort": "xhigh",
+      "preserve_thinking": true,
       "verbose_tool_instructions": false,
       "unwrap_tool_envelope": false,
       "strict_tool_arguments": true,
       "inject_tool_error_warnings": false}
 
    THINK TOKEN PRECEDENCE (same message):
-     system/developer: <|think_on|> wins if both appear
-     user:             <|think_off|> wins if both appear
+     system/developer: <|think_on|> wins if both on/off appear;
+                       among effort tokens, xhigh wins
+     user:             <|think_off|> wins if on/off/effort appear together;
+                       else first matching effort token (xhigh, then low, then medium)
 
    USAGE
    -----
    LM Studio:  My Models → model settings → Prompt Template → paste path
-   vLLM/SGLang: --chat-template /path/to/qwen_fixed_template.jinja
+   vLLM/SGLang: --chat-template /path/to/qwen38_fixed_template.jinja
                --tool-call-parser qwen3_coder --reasoning-parser qwen3
 
-   Tests: python tests/test_qwen_fixed_template.py
+   Tests: python tests/test_qwen38_fixed_template.py
 
    LM STUDIO / HF JINJA: logic inlined (no namespace-as-macro-arg).
 ---------------------------------------------------------------------#}
@@ -115,9 +138,27 @@
         {{- raise_exception('Unexpected content type.') }}
     {%- endif %}
 {%- endmacro %}
-{%- set ns_flags = namespace(enable_thinking=true, has_tools=false, last_tool_failed=false, consecutive_failures=0) %}
+{%- macro strip_think_control_tokens(text) %}
+    {{- text | replace('<|think_off|>', '') | replace('<|think_on|>', '') | replace('<|think_low|>', '') | replace('<|think_medium|>', '') | replace('<|think_xhigh|>', '') | replace('<|think_high|>', '') | replace('<|think_minimal|>', '') | trim }}
+{%- endmacro %}
+{%- set ns_flags = namespace(enable_thinking=true, effort='low', has_tools=false, last_tool_failed=false, consecutive_failures=0) %}
 {%- if enable_thinking is defined %}
     {%- set ns_flags.enable_thinking = enable_thinking %}
+{%- endif %}
+{%- if reasoning_effort is defined and reasoning_effort is not none %}
+    {%- set _effort_raw = reasoning_effort | string | lower | trim %}
+    {%- if _effort_raw in ('none', 'off') %}
+        {%- set ns_flags.enable_thinking = false %}
+        {%- set ns_flags.effort = 'medium' %}
+    {%- elif _effort_raw in ('low', 'minimal') %}
+        {%- set ns_flags.effort = 'low' %}
+    {%- elif _effort_raw == 'medium' %}
+        {%- set ns_flags.effort = 'medium' %}
+    {%- elif _effort_raw in ('xhigh', 'high', 'max') %}
+        {%- set ns_flags.effort = 'xhigh' %}
+    {%- else %}
+        {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '. Supported types are xhigh, medium, and low (template default: low).') }}
+    {%- endif %}
 {%- endif %}
 {%- if not messages %}
     {{- raise_exception('No messages provided.') }}
@@ -136,6 +177,58 @@
 {%- if ns_query.multi_step_tool %}
     {{- raise_exception('No user query found in messages.') }}
 {%- endif %}
+{#- Q8: request-level effort/thinking for the injected system instruction.
+    History rendering still walks tokens turn-by-turn via ns_flags. -#}
+{%- set ns_inject = namespace(enable_thinking=ns_flags.enable_thinking, effort=ns_flags.effort) %}
+{%- for message in messages %}
+    {%- set is_sys = (message.role == "system" or message.role == "developer") %}
+    {%- if (is_sys and loop.first) or message.role == "user" %}
+        {%- set scan = render_content(message.content, false, is_sys)|trim %}
+        {%- if is_sys %}
+            {%- if '<|think_off|>' in scan %}
+                {%- set ns_inject.enable_thinking = false %}
+            {%- endif %}
+            {%- if '<|think_on|>' in scan %}
+                {%- set ns_inject.enable_thinking = true %}
+            {%- endif %}
+            {%- if '<|think_low|>' in scan or '<|think_minimal|>' in scan %}
+                {%- set ns_inject.enable_thinking = true %}
+                {%- set ns_inject.effort = 'low' %}
+            {%- endif %}
+            {%- if '<|think_medium|>' in scan %}
+                {%- set ns_inject.enable_thinking = true %}
+                {%- set ns_inject.effort = 'medium' %}
+            {%- endif %}
+            {%- if '<|think_xhigh|>' in scan or '<|think_high|>' in scan %}
+                {%- set ns_inject.enable_thinking = true %}
+                {%- set ns_inject.effort = 'xhigh' %}
+            {%- endif %}
+        {%- else %}
+            {%- if '<|think_off|>' in scan %}
+                {%- set ns_inject.enable_thinking = false %}
+            {%- elif '<|think_on|>' in scan %}
+                {%- set ns_inject.enable_thinking = true %}
+            {%- elif '<|think_xhigh|>' in scan or '<|think_high|>' in scan %}
+                {%- set ns_inject.enable_thinking = true %}
+                {%- set ns_inject.effort = 'xhigh' %}
+            {%- elif '<|think_low|>' in scan or '<|think_minimal|>' in scan %}
+                {%- set ns_inject.enable_thinking = true %}
+                {%- set ns_inject.effort = 'low' %}
+            {%- elif '<|think_medium|>' in scan %}
+                {%- set ns_inject.enable_thinking = true %}
+                {%- set ns_inject.effort = 'medium' %}
+            {%- endif %}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- set reasoning_instructions = '' %}
+{%- if ns_inject.enable_thinking is not false %}
+    {%- if ns_inject.effort == 'xhigh' %}
+        {%- set reasoning_instructions = 'Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.' %}
+    {%- elif ns_inject.effort == 'low' %}
+        {%- set reasoning_instructions = 'Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.' %}
+    {%- endif %}
+{%- endif %}
 {%- set system_content = '' %}
 {%- set has_system = false %}
 {%- if messages[0].role == 'system' or messages[0].role == 'developer' %}
@@ -143,17 +236,30 @@
     {%- set system_content = render_content(messages[0].content, false, true)|trim %}
     {%- if '<|think_off|>' in system_content %}
         {%- set ns_flags.enable_thinking = false %}
-        {%- set system_content = system_content | replace('<|think_off|>', '') %}
     {%- endif %}
     {%- if '<|think_on|>' in system_content %}
         {%- set ns_flags.enable_thinking = true %}
-        {%- set system_content = system_content | replace('<|think_on|>', '') %}
     {%- endif %}
-    {%- set system_content = system_content | trim %}
+    {%- if '<|think_low|>' in system_content or '<|think_minimal|>' in system_content %}
+        {%- set ns_flags.enable_thinking = true %}
+        {%- set ns_flags.effort = 'low' %}
+    {%- endif %}
+    {%- if '<|think_medium|>' in system_content %}
+        {%- set ns_flags.enable_thinking = true %}
+        {%- set ns_flags.effort = 'medium' %}
+    {%- endif %}
+    {%- if '<|think_xhigh|>' in system_content or '<|think_high|>' in system_content %}
+        {%- set ns_flags.enable_thinking = true %}
+        {%- set ns_flags.effort = 'xhigh' %}
+    {%- endif %}
+    {%- set system_content = strip_think_control_tokens(system_content) %}
 {%- endif %}
 {%- if tools and tools is iterable and tools is not mapping %}
     {%- set ns_flags.has_tools = true %}
     {{- '<|im_start|>system\n' }}
+    {%- if reasoning_instructions %}
+        {{- reasoning_instructions + '\n\n' }}
+    {%- endif %}
     {{- "# Tools\n\nYou have access to the following functions:\n\n<tools>" }}
     {%- for tool in tools %}
         {{- '\n' }}
@@ -233,7 +339,9 @@ Reminder:
     {%- endif %}
     {{- '<|im_end|>\n' }}
 {%- elif has_system and system_content %}
-    {{- '<|im_start|>system\n' + system_content + '<|im_end|>\n' }}
+    {{- '<|im_start|>system\n' + (reasoning_instructions + '\n\n' if reasoning_instructions else '') + system_content + '<|im_end|>\n' }}
+{%- elif reasoning_instructions %}
+    {{- '<|im_start|>system\n' + reasoning_instructions + '<|im_end|>\n' }}
 {%- endif %}
 {%- for message in messages %}
     {%- set is_system = (message.role == "system" or message.role == "developer") %}
@@ -245,21 +353,29 @@ Reminder:
     {%- elif message.role == "user" %}
         {%- if '<|think_off|>' in content %}
             {%- set ns_flags.enable_thinking = false %}
-            {%- set content = content | replace('<|think_off|>', '') | trim %}
         {%- elif '<|think_on|>' in content %}
             {%- set ns_flags.enable_thinking = true %}
-            {%- set content = content | replace('<|think_on|>', '') | trim %}
+        {%- elif '<|think_xhigh|>' in content or '<|think_high|>' in content %}
+            {%- set ns_flags.enable_thinking = true %}
+            {%- set ns_flags.effort = 'xhigh' %}
+        {%- elif '<|think_low|>' in content or '<|think_minimal|>' in content %}
+            {%- set ns_flags.enable_thinking = true %}
+            {%- set ns_flags.effort = 'low' %}
+        {%- elif '<|think_medium|>' in content %}
+            {%- set ns_flags.enable_thinking = true %}
+            {%- set ns_flags.effort = 'medium' %}
         {%- endif %}
+        {%- set content = strip_think_control_tokens(content) %}
         {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>\n' }}
         {%- set ns_flags.last_tool_failed = false %}
         {%- set ns_flags.consecutive_failures = 0 %}
     {%- elif message.role == "assistant" %}
         {%- set ns_flags.last_tool_failed = false %}
         {#- P4b: strip control tokens from round-tripped assistant text; do not re-parse. -#}
-        {%- set content = content | replace('<|think_off|>', '') | replace('<|think_on|>', '') | trim %}
+        {%- set content = strip_think_control_tokens(content) %}
         {%- set reasoning_content = '' %}
         {%- if message.reasoning_content is string %}
-            {%- set reasoning_content = message.reasoning_content | replace('<|think_off|>', '') | replace('<|think_on|>', '') | trim %}
+            {%- set reasoning_content = strip_think_control_tokens(message.reasoning_content) %}
             {%- set think_end_token = '' %}
             {%- if '</think>' in content %}
                 {%- set think_end_token = '</think>' %}

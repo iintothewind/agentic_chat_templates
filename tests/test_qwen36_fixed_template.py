@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render tests for qwen_fixed_template.jinja (HF-compatible Jinja env)."""
+"""Render tests for qwen36_fixed_template.jinja (HF-compatible Jinja env)."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from jinja2.ext import loopcontrols
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 ROOT = Path(__file__).resolve().parents[1]
-TEMPLATE_PATH = ROOT / "qwen_fixed_template.jinja"
+TEMPLATE_PATH = ROOT / "qwen36_fixed_template.jinja"
 
 SEARCH_TOOL = {
     "type": "function",
@@ -24,9 +24,9 @@ SEARCH_TOOL = {
 }
 
 
-def compile_template(*, with_from_json: bool = False):
+def compile_template(*, with_from_json: bool = False, path: Path | None = None):
     """Mirror HuggingFace chat-template Jinja setup; optional LM Studio from_json."""
-    source = TEMPLATE_PATH.read_text(encoding="utf-8")
+    source = (path or TEMPLATE_PATH).read_text(encoding="utf-8")
 
     def raise_exception(message: str):
         raise TemplateError(message)
@@ -61,7 +61,7 @@ def assistant_tool_call(name: str, arguments, *, content: str = "", reasoning: s
     return msg
 
 
-class QwenFixedChatTemplateTests(unittest.TestCase):
+class Qwen36FixedChatTemplateTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.template = compile_template()
@@ -732,7 +732,7 @@ class QwenFixedChatTemplateTests(unittest.TestCase):
 
 def main() -> int:
     loader = unittest.TestLoader()
-    suite = loader.loadTestsFromTestCase(QwenFixedChatTemplateTests)
+    suite = loader.loadTestsFromTestCase(Qwen36FixedChatTemplateTests)
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
     print(f"\nTotal tests: {result.testsRun}")
