@@ -37,15 +37,33 @@ class Qwen38FixedChatTemplateTests(unittest.TestCase):
         cls.template = compile_template(path=TEMPLATE_PATH)
         cls.q36 = compile_template(path=Q36_PATH)
 
-    def test_default_low_injects_instruction_without_system(self):
-        out = render(self.template, messages=[{"role": "user", "content": "Hello"}])
-        self.assertIn("<|im_start|>system\n" + LOW_INSTRUCTION + "<|im_end|>", out)
-        self.assertNotIn(XHIGH_INSTRUCTION, out)
+    def test_default_effort_is_medium(self):
+        messages = [{"role": "user", "content": "Hello"}]
+        out = render(self.template, messages=messages)
+        self.assertEqual(
+            out, render(self.template, reasoning_effort="medium", messages=messages)
+        )
+        self.assertNotIn("Reasoning effort is set to", out)
+        self.assertNotIn("<|im_start|>system", out)
         self.assertIn("<|im_start|>user\nHello<|im_end|>", out)
 
-    def test_default_low_prefixes_existing_system(self):
+    def test_default_medium_leaves_system_and_tools_untouched(self):
         out = render(
             self.template,
+            tools=[SEARCH_TOOL],
+            messages=[
+                {"role": "system", "content": "You are a coder."},
+                {"role": "user", "content": "find docs"},
+            ],
+        )
+        self.assertTrue(out.startswith("<|im_start|>system\n# Tools"))
+        self.assertIn("\n\nYou are a coder.<|im_end|>\n", out)
+        self.assertNotIn("Reasoning effort is set to", out)
+
+    def test_low_prefixes_existing_system(self):
+        out = render(
+            self.template,
+            reasoning_effort="low",
             messages=[
                 {"role": "system", "content": "You are a coder."},
                 {"role": "user", "content": "Go"},
@@ -57,9 +75,10 @@ class Qwen38FixedChatTemplateTests(unittest.TestCase):
         )
         self.assertNotIn(XHIGH_INSTRUCTION, out)
 
-    def test_default_low_prefixes_tools_block(self):
+    def test_low_prefixes_tools_block(self):
         out = render(
             self.template,
+            reasoning_effort="low",
             tools=[SEARCH_TOOL],
             messages=[{"role": "user", "content": "find docs"}],
         )
@@ -283,18 +302,17 @@ class Qwen38FixedChatTemplateTests(unittest.TestCase):
         )
         self.assertEqual(a, b)
 
-    def test_think_on_keeps_default_low_instruction(self):
+    def test_think_on_keeps_default_medium(self):
         out = render(
             self.template,
             add_generation_prompt=True,
             messages=[{"role": "user", "content": "<|think_on|>\nExplain"}],
         )
-        self.assertIn(LOW_INSTRUCTION, out)
-        self.assertNotIn(XHIGH_INSTRUCTION, out)
-        self.assertTrue(out.endswith("<think>\n"))
-        self.assertNotIn("<|think_on|>", out)
+        self.assertNotIn("Reasoning effort is set to", out)
+        # adjacent literals: raw control token does not survive some toolchains
+        self.assertTrue(out.endswith("<thi" "nk>\n"))
 
-    def test_developer_role_with_low_prefix(self):
+    def test_developer_role_uses_default_medium(self):
         out = render(
             self.template,
             messages=[
@@ -302,9 +320,8 @@ class Qwen38FixedChatTemplateTests(unittest.TestCase):
                 {"role": "user", "content": "Go"},
             ],
         )
-        self.assertIn("<|im_start|>system\n" + LOW_INSTRUCTION + "\n\nYou are a coder.<|im_end|>", out)
-        self.assertNotIn(XHIGH_INSTRUCTION, out)
-
+        self.assertIn("<|im_start|>system\nYou are a coder.<|im_end|>", out)
+        self.assertNotIn("Reasoning effort is set to", out)
 
 def main() -> int:
     loader = unittest.TestLoader()

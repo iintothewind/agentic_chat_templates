@@ -46,10 +46,10 @@
    Qwen 3.8 native (this file):
    Q8  reasoning_effort steering (official Qwen3.8 protocol).
        chat_template_kwargs.reasoning_effort:
-         low    (default)  injects the official brief-reasoning instruction
-         medium            no extra instruction (neutral baseline)
-         xhigh             injects the official deep-reasoning instruction
-         none / off        disable thinking (same as enable_thinking=false)
+        medium (default)  no extra instruction (neutral baseline)
+        low               injects the official brief-reasoning instruction
+        xhigh             injects the official deep-reasoning instruction
+        none / off        disable thinking (same as enable_thinking=false)
        Harness aliases (do not 500): high/max → xhigh, minimal → low.
        Unknown values still raise, matching official validation.
        Prompt-level tokens (stripped, never tokenized):
@@ -60,7 +60,7 @@
        instruction. Unlike official 3.8, disabling thinking is supported.
 
    chat_template_kwargs defaults (agent-friendly):
-     enable_thinking=true, reasoning_effort=low (official 3.8 default is xhigh),
+    enable_thinking=true, reasoning_effort=medium (official 3.8 default is xhigh),
      preserve_thinking=undefined (→ preserve all),
      unwrap_tool_envelope=true, inject_tool_error_warnings=true
 
@@ -141,7 +141,7 @@
 {%- macro strip_think_control_tokens(text) %}
     {{- text | replace('<|think_off|>', '') | replace('<|think_on|>', '') | replace('<|think_low|>', '') | replace('<|think_medium|>', '') | replace('<|think_xhigh|>', '') | replace('<|think_high|>', '') | replace('<|think_minimal|>', '') | trim }}
 {%- endmacro %}
-{%- set ns_flags = namespace(enable_thinking=true, effort='low', has_tools=false, last_tool_failed=false, consecutive_failures=0) %}
+{%- set ns_flags = namespace(enable_thinking=true, effort='medium', has_tools=false, last_tool_failed=false, consecutive_failures=0) %}
 {%- if enable_thinking is defined %}
     {%- set ns_flags.enable_thinking = enable_thinking %}
 {%- endif %}
@@ -157,7 +157,7 @@
     {%- elif _effort_raw in ('xhigh', 'high', 'max') %}
         {%- set ns_flags.effort = 'xhigh' %}
     {%- else %}
-        {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '. Supported types are xhigh, medium, and low (template default: low).') }}
+        {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '. Supported types are xhigh, medium, and low (template default: medium).') }}
     {%- endif %}
 {%- endif %}
 {%- if not messages %}

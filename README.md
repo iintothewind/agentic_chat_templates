@@ -77,7 +77,7 @@ Same-message precedence:
 ### Qwen 3.8 reasoning effort
 
 Qwen 3.8 can steer thinking depth via `chat_template_kwargs.reasoning_effort`
-(`low` default here; official is `xhigh`). `medium` injects no extra system
+(`medium` default here; official is `xhigh`). `medium` injects no extra system
 text; `xhigh` / `low` inject the official instruction strings.
 
 ```json
