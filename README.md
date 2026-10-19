@@ -61,8 +61,10 @@ My Models → model settings → Prompt Template → paste the `.jinja` path.
 
 ### Prompt-level thinking control
 
-Insert either token in the first system/developer message or any user message.
-Tokens are stripped before render and never reach the model tokenizer.
+Insert either token in the first system/developer message or in the **last**
+user message. Tokens in earlier user turns are rendered verbatim, so the
+prompt keeps the distribution the model was trained on; only the last turn
+steers the current generation. This applies to Gemma 4 as well as Qwen.
 
 ```json
 {"role": "user", "content": "<|think_off|>\nAnswer briefly."}
@@ -92,6 +94,21 @@ Harness aliases: `high` / `max` → `xhigh`, `minimal` → `low`, `none` / `off`
 {"role": "user", "content": "<|think_medium|>\nNormal."}
 {"role": "user", "content": "<|think_xhigh|>\nGo deep."}
 ```
+
+### Fixed behaviour
+
+Differences from the upstream templates that these forks correct. Each one is
+covered by a regression test in `tests/`.
+
+| Area | Upstream | Here |
+|------|----------|------|
+| Multimodal content parts | a string part is sniffed for `image` / `video`, so `["an image of a cat"]` renders as a vision token; a part without those words raises | string parts render as text, other parts render as text, only real image/video parts become vision tokens |
+| JSON-string tool arguments (Gemma 4) | `arguments` must already be a dict; a JSON string is emitted raw inside `call:f{...}` | `parse_string_arguments=true` expands a JSON object into the exact fragment the official template emits for a mapping (`key:<|"|>value<|"|>,num:42`), with a built-in parser (no `from_json` filter, so it works on transformers / vLLM / SGLang as well as LM Studio); `\uXXXX` escapes are decoded, so CJK arguments survive `json.dumps(ensure_ascii=True)` |
+| JSON-string tool arguments | `arguments` must already be a dict; a JSON string is emitted raw inside `<function=...>` | `parse_string_arguments=true` expands a JSON object into `<parameter=...>` blocks with a built-in parser (no `from_json` filter, so it works on transformers / vLLM / SGLang as well as LM Studio); `\uXXXX` escapes are decoded, so CJK arguments survive `json.dumps(ensure_ascii=True)` |
+| Tool-error detection | the whole payload body is scanned, so prose like `failed to build` or a `command not found` string inside a source file triggers a false "the tool call returned an error" warning | detection is anchored to the head of the payload and to real error fields, so log prose and code snippets no longer raise false warnings |
+| Think-control tokens | every user turn is parsed, so a token in an earlier turn changes the whole history | only the first system/developer message and the last user turn are parsed; earlier turns pass through verbatim |
+| Assistant turn layout | a past assistant turn with no `reasoning_content` renders as `assistant\n{content}` | the think block is always emitted, matching upstream byte for byte: `assistant\n<think>\n{reasoning}\n</think>\n\n{content}` |
+| Tool instructions | always demand a `<think>` skeleton, even when thinking is disabled | the instruction block follows the effective thinking state, so it never asks for a block the model will not emit |
 
 ### Upstream parity kwargs
 
@@ -146,6 +163,21 @@ python -m unittest discover -s tests -v
 ```
 
 Requires Python 3 + Jinja2 (`pip install jinja2`).
+
+The suite includes a seeded fuzz test for the built-in JSON argument
+parsers, plus a comparison against the **official** upstream templates:
+
+- **Gemma 4** - compared against `google/gemma-4-31B-it`'s
+  `chat_template.jinja`, so the JSON-string path must produce exactly
+  the fragment the official `format_argument` produces for a mapping.
+- **Qwen 3.8** - compared against `Qwen/Qwen3.8-27B` and
+  `Qwen/Qwen3.8-2.4T-A95B-FP8`. The official template only accepts a
+  mapping for `tool_call.arguments`, so the same value is rendered
+  twice: as a dict on the official template, as a JSON string on the
+  fork. The tool-call fragments must be identical.
+
+The official templates are cached under `tests/_official_qwen38/` and
+skipped when the network is unavailable.
 
 ## License
 

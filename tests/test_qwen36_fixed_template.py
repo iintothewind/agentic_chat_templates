@@ -13,6 +13,8 @@ from jinja2.ext import loopcontrols
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 ROOT = Path(__file__).resolve().parents[1]
+
+NL = '\n'  # newline inside assertion strings
 TEMPLATE_PATH = ROOT / "qwen36_fixed_template.jinja"
 
 SEARCH_TOOL = {
@@ -78,7 +80,7 @@ class Qwen36FixedChatTemplateTests(unittest.TestCase):
             ],
         )
         self.assertIn("<|im_start|>user\nHello<|im_end|>", out)
-        self.assertIn("<|im_start|>assistant\nHi there<|im_end|>", out)
+        self.assertIn("<|im_start|>assistant\n<think>\n\n</think>\n\nHi there<|im_end|>", out)
 
     def test_empty_messages_raises(self):
         with self.assertRaises(TemplateError):
@@ -92,7 +94,7 @@ class Qwen36FixedChatTemplateTests(unittest.TestCase):
                 {"role": "assistant", "content": ""},
             ],
         )
-        self.assertIn("<|im_start|>assistant\n<|im_end|>", out)
+        self.assertIn("<|im_start|>assistant\n<think>\n\n</think>\n\n<|im_end|>", out)
 
     def test_unexpected_role_raises(self):
         with self.assertRaises(TemplateError):
@@ -184,20 +186,26 @@ class Qwen36FixedChatTemplateTests(unittest.TestCase):
             )
         self.assertIn("mapping", str(ctx.exception).lower())
 
-    def test_parse_string_arguments_without_from_json_raises(self):
-        with self.assertRaises(TemplateError):
-            render(
-                self.template,
-                parse_string_arguments=True,
-                messages=[
-                    {"role": "user", "content": "run"},
-                    assistant_tool_call("run", '{"cmd": "ls"}'),
-                ],
-            )
+    def test_parse_string_arguments_works_without_from_json_filter(self):
+        """JSON string args must expand on runtimes that lack from_json.
+
+        transformers/vLLM/SGLang have no from_json filter, so the template
+        must not depend on it.
+        """
+        out = render(
+            self.template,
+            parse_string_arguments=True,
+            messages=[
+                {"role": "user", "content": "run"},
+                assistant_tool_call("run", '{"cmd": "ls"}'),
+            ],
+        )
+        self.assertIn("<parameter=cmd>\nls", out)
+        self.assertNotIn('{"cmd": "ls"', out)
 
     def test_parse_string_arguments_expands_parameters(self):
         out = render(
-            self.lmstudio_template,
+            self.template,
             parse_string_arguments=True,
             messages=[
                 {"role": "user", "content": "run"},
@@ -208,9 +216,21 @@ class Qwen36FixedChatTemplateTests(unittest.TestCase):
         self.assertIn("<parameter=cwd>\n/tmp", out)
         self.assertNotIn('{"cmd": "ls"', out)
 
+    def test_parse_string_arguments_decodes_unicode_escapes(self):
+        """json.dumps defaults to ensure_ascii=True, so CJK arrives escaped."""
+        out = render(
+            self.template,
+            parse_string_arguments=True,
+            messages=[
+                {"role": "user", "content": "run"},
+                assistant_tool_call("run", '{"path": "\\u4f60\\u597d"}'),
+            ],
+        )
+        self.assertIn("<parameter=path>\n你好", out)
+
     def test_parse_string_arguments_non_object_json_falls_back_raw(self):
         out = render(
-            self.lmstudio_template,
+            self.template,
             parse_string_arguments=True,
             messages=[
                 {"role": "user", "content": "run"},
@@ -283,7 +303,7 @@ class Qwen36FixedChatTemplateTests(unittest.TestCase):
                 ),
             ],
         )
-        self.assertIn("<|im_start|>assistant\nprefix\n\n<tool_call>", out)
+        self.assertIn("<|im_start|>assistant\n<think>\n\n</think>\n\nprefix\n\n<tool_call>", out)
         self.assertEqual(out.count("<tool_call>"), 1)
 
     # --- thinking control ---
@@ -342,7 +362,7 @@ class Qwen36FixedChatTemplateTests(unittest.TestCase):
             ],
         )
         self.assertNotIn("secret", out)
-        self.assertIn("<|im_start|>assistant\nanswer", out)
+        self.assertNotIn("<|im_start|>assistant\n<think>", out)
 
     def test_think_token_not_parsed_in_tool_payload(self):
         out = render(
@@ -483,7 +503,7 @@ class Qwen36FixedChatTemplateTests(unittest.TestCase):
                 assistant_tool_call("x", {}),
             ],
         )
-        self.assertIn("<|im_start|>assistant\n<tool_call>", out)
+        self.assertIn("<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>", out)
 
     # --- tool responses / errors ---
 
@@ -507,12 +527,40 @@ class Qwen36FixedChatTemplateTests(unittest.TestCase):
         )
         self.assertNotIn("SYSTEM WARNING", out)
 
-    def test_long_error_content_skips_warning(self):
+    def test_long_error_payload_still_triggers_warning(self):
+        """Detection is head-anchored, so payload size no longer suppresses it."""
         out = render(
             self.template,
             messages=[
                 {"role": "user", "content": "run"},
                 {"role": "tool", "content": '{"error": true, "detail": "' + ("x" * 600) + '"}'},
+            ],
+        )
+        self.assertIn("SYSTEM WARNING", out)
+
+    def test_error_word_in_prose_does_not_trigger_warning(self):
+        out = render(
+            self.template,
+            messages=[
+                {"role": "user", "content": "run"},
+                {
+                    "role": "tool",
+                    "content": "OK: the previous release failed to build on CI, "
+                    "but current HEAD is green",
+                },
+            ],
+        )
+        self.assertNotIn("SYSTEM WARNING", out)
+
+    def test_json_payload_note_mentioning_error_is_not_a_failure(self):
+        out = render(
+            self.template,
+            messages=[
+                {"role": "user", "content": "run"},
+                {
+                    "role": "tool",
+                    "content": '{"result":"ok","note":"command not found is a legacy message"}',
+                },
             ],
         )
         self.assertNotIn("SYSTEM WARNING", out)
@@ -729,6 +777,143 @@ class Qwen36FixedChatTemplateTests(unittest.TestCase):
         )
         self.assertIn("<|vision_start|><|video_pad|><|vision_end|>", out)
 
+
+    # --- T-A/T-B/T-C/T-D/T-E/T-F regressions ---
+
+    def test_multimodal_string_item_is_text_not_image(self):
+        """A plain string content part must not be sniffed as an image."""
+        out = render(
+            self.template,
+            messages=[{"role": "user", "content": ["an image of a cat"]}],
+        )
+        self.assertIn("an image of a cat", out)
+        self.assertNotIn("<|image_pad|>", out)
+
+    def test_multimodal_plain_string_item_does_not_raise(self):
+        out = render(
+            self.template,
+            messages=[{"role": "user", "content": ["hello world"]}],
+        )
+        self.assertIn("hello world", out)
+
+    def test_multimodal_image_part_still_rendered(self):
+        out = render(
+            self.template,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "image_url": {"url": "http://x"}}],
+                }
+            ],
+        )
+        self.assertIn("<|vision_start|><|image_pad|><|vision_end|>", out)
+
+    def test_parse_string_arguments_without_from_json_filter(self):
+        """transformers/vLLM/SGLang have no from_json filter."""
+        out = render(
+            self.template,
+            parse_string_arguments=True,
+            messages=[
+                {"role": "user", "content": "run"},
+                assistant_tool_call("run", '{"cmd": "ls"}'),
+            ],
+        )
+        self.assertIn("<parameter=cmd>" + NL + "ls", out)
+
+    def test_tool_error_prose_does_not_trigger_warning(self):
+        out = render(
+            self.template,
+            messages=[
+                {"role": "user", "content": "check"},
+                {
+                    "role": "tool",
+                    "content": "OK: the previous release failed to build on CI, "
+                    "but current HEAD is green",
+                },
+            ],
+        )
+        self.assertNotIn("SYSTEM WARNING", out)
+
+    def test_tool_error_json_note_does_not_trigger_warning(self):
+        out = render(
+            self.template,
+            messages=[
+                {"role": "user", "content": "check"},
+                {
+                    "role": "tool",
+                    "content": '{"result":"ok","note":"command not found is legacy"}',
+                },
+            ],
+        )
+        self.assertNotIn("SYSTEM WARNING", out)
+
+    def test_real_tool_error_still_triggers_warning(self):
+        out = render(
+            self.template,
+            messages=[
+                {"role": "user", "content": "run"},
+                {"role": "tool", "content": '{"error": true, "msg": "boom"}'},
+            ],
+        )
+        self.assertIn("SYSTEM WARNING", out)
+
+    def test_historical_think_token_is_passed_through_verbatim(self):
+        """T-D: only the last user turn may steer thinking."""
+        out = render(
+            self.template,
+            messages=[
+                {"role": "user", "content": "<|think_off|>" + NL + "first"},
+                {"role": "assistant", "content": "a"},
+                {"role": "user", "content": "second"},
+            ],
+            add_generation_prompt=True,
+        )
+        self.assertIn("<|think_off|>", out)
+        self.assertTrue(out.endswith("<think>" + NL))
+
+    def test_last_user_turn_think_token_still_steers_generation(self):
+        out = render(
+            self.template,
+            messages=[
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "a"},
+                {"role": "user", "content": "<|think_off|>" + NL + "second"},
+            ],
+            add_generation_prompt=True,
+        )
+        self.assertNotIn("<|think_off|>", out)
+        self.assertIn("<think>" + NL + "</think>", out.split("assistant")[-1])
+
+    def test_tool_instructions_follow_thinking_state(self):
+        """T-F: instructions must not demand a think block that is not emitted."""
+        on = render(
+            self.template,
+            tools=[SEARCH_TOOL],
+            messages=[{"role": "user", "content": "go"}],
+        )
+        off = render(
+            self.template,
+            tools=[SEARCH_TOOL],
+            enable_thinking=False,
+            messages=[{"role": "user", "content": "go"}],
+        )
+        self.assertIn("<think>" + NL + "Brief explanation of tool call", on)
+        self.assertNotIn("<think>" + NL + "Brief explanation of tool call", off)
+        self.assertNotIn("MUST be placed strictly inside", off)
+        self.assertIn("MUST be placed strictly inside", on)
+
+    def test_posix_shell_failure_triggers_warning(self):
+        out = render(
+            self.template,
+            messages=[
+                {"role": "user", "content": "read it"},
+                {
+                    "role": "tool",
+                    "content": "cat: README.md: No such file or directory",
+                },
+            ],
+        )
+        self.assertIn("SYSTEM WARNING", out)
 
 def main() -> int:
     loader = unittest.TestLoader()

@@ -1,0 +1,22 @@
+# Normalize all text files to LF in the repository and in the working tree.
+#
+# text=auto lets git detect text vs binary; eol=lf forces LF on checkout so
+# the working tree matches the index on every platform.
+* text=auto eol=lf
+
+# Binary files: never touched by the text rules above.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.bz2 binary
+*.xz binary
+*.7z binary
+*.tar binary
+*.safetensors binary
+*.bin binary

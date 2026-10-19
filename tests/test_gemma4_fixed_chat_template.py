@@ -65,6 +65,15 @@ def render(template, *, add_generation_prompt=False, **kwargs) -> str:
     return template.render(add_generation_prompt=add_generation_prompt, **defaults)
 
 
+
+def _call_fragment(text):
+    """Extract the argument fragment from a rendered tool call."""
+    start = text.index("call:")
+    start = text.index("{", start) + 1
+    end = text.index("}<tool_call|>", start)
+    return text[start:end]
+
+
 class Gemma4FixedChatTemplateTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -183,25 +192,100 @@ class Gemma4FixedChatTemplateTests(unittest.TestCase):
         self.assertIn("cwd:", out)
         self.assertNotIn('{"cmd": "ls"', out)
 
-    def test_parse_string_arguments_without_from_json_raises(self):
-        with self.assertRaises(TemplateError):
-            render(
-                self.template,
-                parse_string_arguments=True,
-                messages=[
-                    {"role": "user", "content": "run"},
-                    {
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [
-                            {
-                                "type": "function",
-                                "function": {"name": "run", "arguments": '{"cmd": "ls"}'},
-                            }
-                        ],
-                    },
-                ],
-            )
+    def test_parse_string_arguments_without_from_json_filter(self):
+        """transformers/vLLM/SGLang have no from_json filter.
+
+        The template must expand JSON string arguments on its own.
+        """
+        out = render(
+            self.template,
+            parse_string_arguments=True,
+            messages=[
+                {"role": "user", "content": "run"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {"name": "run", "arguments": '{"cmd": "ls"}'},
+                        }
+                    ],
+                },
+            ],
+        )
+        self.assertIn('cmd:<|"|>ls<|"|>', out)
+        self.assertNotIn('{"cmd": "ls"}', out)
+
+    def test_parse_string_arguments_matches_mapping_path(self):
+        """The JSON-string path must equal the official mapping path.
+
+        The official Gemma 4 template renders an already-deserialized
+        mapping. Expanding a JSON string must produce the same fragment.
+        """
+        args = {"cmd": "ls", "cwd": "/tmp", "n": 42, "b": True}
+        as_dict = render(
+            self.template,
+            messages=[
+                {"role": "user", "content": "run"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {"name": "run", "arguments": args},
+                        }
+                    ],
+                },
+            ],
+        )
+        as_json = render(
+            self.template,
+            parse_string_arguments=True,
+            messages=[
+                {"role": "user", "content": "run"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "run",
+                                "arguments": json.dumps(args),
+                            },
+                        }
+                    ],
+                },
+            ],
+        )
+        self.assertEqual(_call_fragment(as_dict), _call_fragment(as_json))
+
+    def test_parse_string_arguments_decodes_unicode_escapes(self):
+        """json.dumps defaults to ensure_ascii=True, so CJK arrives escaped.
+        """
+        out = render(
+            self.template,
+            parse_string_arguments=True,
+            messages=[
+                {"role": "user", "content": "run"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "run",
+                                "arguments": '{"path": "\\u4f60\\u597d"}',
+                            },
+                        }
+                    ],
+                },
+            ],
+        )
+        self.assertIn("path:<|\"|>\u4f60\u597d<|\"|>", out)
 
     def test_unwrap_bare_function_spec(self):
         out = render(
@@ -567,6 +651,137 @@ class Gemma4FixedChatTemplateTests(unittest.TestCase):
         )
         self.assertIn("<|audio|>", out)
 
+
+    # --- G-A / G-C / G-D regressions ---
+
+    def test_multimodal_string_item_is_text(self):
+        """A plain string content part must render as text."""
+        out = render(
+            self.template,
+            messages=[{"role": "user", "content": ["hello world"]}],
+        )
+        self.assertIn("hello world", out)
+
+    def test_multimodal_string_item_is_not_media(self):
+        out = render(
+            self.template,
+            messages=[{"role": "user", "content": ["an image of a cat"]}],
+        )
+        self.assertIn("an image of a cat", out)
+        self.assertNotIn("<|image|>", out)
+
+    def test_multimodal_image_part_still_rendered(self):
+        out = render(
+            self.template,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"type": "image", "image_url": {"url": "u"}}],
+                }
+            ],
+        )
+        self.assertIn("<|image|>", out)
+
+    def test_tool_error_prose_does_not_trigger_warning(self):
+        out = render(
+            self.template,
+            messages=[
+                {"role": "user", "content": "check"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"type": "function", "function": {"name": "f", "arguments": {}}}
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "content": "OK: the previous release failed to build on CI, "
+                    "but current HEAD is green",
+                },
+            ],
+        )
+        self.assertNotIn("SYSTEM WARNING", out)
+
+    def test_tool_error_json_note_does_not_trigger_warning(self):
+        out = render(
+            self.template,
+            messages=[
+                {"role": "user", "content": "check"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"type": "function", "function": {"name": "f", "arguments": {}}}
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "content": '{"result":"ok","note":"command not found is legacy"}',
+                },
+            ],
+        )
+        self.assertNotIn("SYSTEM WARNING", out)
+
+    def test_real_tool_error_still_triggers_warning(self):
+        out = render(
+            self.template,
+            messages=[
+                {"role": "user", "content": "run"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"type": "function", "function": {"name": "f", "arguments": {}}}
+                    ],
+                },
+                {"role": "tool", "content": '{"error": true}'},
+            ],
+        )
+        self.assertIn("SYSTEM WARNING", out)
+
+    def test_posix_shell_failure_triggers_warning(self):
+        out = render(
+            self.template,
+            messages=[
+                {"role": "user", "content": "read it"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"type": "function", "function": {"name": "f", "arguments": {}}}
+                    ],
+                },
+                {"role": "tool", "content": "cat: README.md: No such file or directory"},
+            ],
+        )
+        self.assertIn("SYSTEM WARNING", out)
+
+    def test_historical_think_token_is_passed_through_verbatim(self):
+        """G-D: only the last user turn may steer thinking."""
+        out = render(
+            self.template,
+            messages=[
+                {"role": "user", "content": "<|think_off|>\nfirst"},
+                {"role": "assistant", "content": "a"},
+                {"role": "user", "content": "second"},
+            ],
+            add_generation_prompt=True,
+        )
+        self.assertIn("<|think_off|>", out)
+
+    def test_last_user_turn_think_token_still_steers_generation(self):
+        out = render(
+            self.template,
+            messages=[
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "a"},
+                {"role": "user", "content": "<|think_off|>\nsecond"},
+            ],
+            add_generation_prompt=True,
+        )
+        self.assertNotIn("<|think_off|>", out)
+        self.assertIn("<|channel>thought", out)
 
 def main() -> int:
     suite = unittest.TestLoader().loadTestsFromTestCase(Gemma4FixedChatTemplateTests)

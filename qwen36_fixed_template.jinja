@@ -1,79 +1,42 @@
 {#---------------------------------------------------------------------
    qwen36_fixed_template.jinja
    =====================================
-   Agent-friendly fork of Qwen chat templates, tuned for open-source
+   Agent-friendly fork of the Qwen chat templates, tuned for open-source
    coding harnesses (opencode, pi, LM Studio, vLLM, SGLang).
 
    TARGET MODELS
    -------------
    Qwen3.5 family (e.g. Qwen3.5-27B, Qwen3.5-35B-A3B, Qwen3.5-Flash)
    Qwen3.6 family (e.g. Qwen3.6-27B, Qwen3.6-35B-A3B, Qwen3-Coder-Next)
-   Thinking / Instruct / Coder / VL variants that ship the Qwen3 chat
+   Thinking / Instruct / Coder / VL variants that ship the Qwen chat
    protocol (<|im_start|>, <think>, <tool_call>/<parameter>).
    Not intended for Qwen2.5 or pre-3.5 models (different chat protocols).
    Not intended for Qwen3.8 — use qwen38_fixed_template.jinja (reasoning_effort).
 
-   DESIGN PRINCIPLES
-   -----------------
-   1. Accuracy first — output must match the format each model family
-      was trained on (official Qwen3.5/3.6 XML tool + thinking blocks).
-   2. Fault tolerance second — accept messy harness inputs (string
-      arguments, developer role, malformed thinking tags) and render
-      valid prompts; avoid silent corruption over blind fail-fast.
-   3. Agent smoothness — defaults tuned for multi-turn tool loops:
-      preserve historical reasoning, inject tool-error guidance, rescue
-      unclosed think blocks; kwargs can restore upstream parity.
-   4. Layered errors — crash only when prompt cannot be made valid;
-      warn/guide when tool calls fail; lenient fallback for wire-format
-      differences (OpenAI JSON-string arguments).
-
-   PATCH INVENTORY
-   ---------------
-   Q1  preserve_thinking defaults ON when kwarg omitted (agent-friendly;
-       mitigates multi-turn tool arguments:{} collapse — pi #3325).
-   Q2  developer role accepted as alias for system.
-   Q3  Robust </think> variant handling + unclosed-think rescue.
-   Q4  Prompt-level thinking via <|think_on|> / <|think_off|> (user +
-       first system/developer only; never parsed in tool/assistant payloads).
-   Q5  Consecutive tool-error guard at generation prompt.
-   Q6  last_query_index rolling checkpoint (official Qwen3 semantics) when
-       preserve_thinking=false; full history kept when omitted or true.
-   Q7  kwargs: verbose_tool_instructions, unwrap_tool_envelope,
-       strict_tool_arguments, parse_string_arguments, inject_tool_error_warnings
-
-   chat_template_kwargs defaults (agent-friendly):
-     enable_thinking=true, preserve_thinking=undefined (→ preserve all),
-     unwrap_tool_envelope=true, inject_tool_error_warnings=true
-
-   preserve_thinking vs official Qwen3.6 API
-   -----------------------------------------
-     this template (kwarg omitted)  ≈  official preserve_thinking=true
-     preserve_thinking=true           ≈  official preserve_thinking=true
-     preserve_thinking=false          ≈  official kwarg omitted (rolling
-                                        checkpoint via last_query_index)
-
-   UPSTREAM PARITY (chat_template_kwargs)
-   --------------------------------------
-     {"enable_thinking": true,
-      "preserve_thinking": false,
-      "verbose_tool_instructions": false,
-      "unwrap_tool_envelope": false,
-      "strict_tool_arguments": true,
-      "inject_tool_error_warnings": false}
-
-   THINK TOKEN PRECEDENCE (same message):
-     system/developer: <|think_on|> wins if both appear
-     user:             <|think_off|> wins if both appear
-
-   USAGE
-   -----
-   LM Studio:  My Models → model settings → Prompt Template → paste path
-   vLLM/SGLang: --chat-template /path/to/qwen36_fixed_template.jinja
-               --tool-call-parser qwen3_coder --reasoning-parser qwen3
-
-   Tests: python tests/test_qwen36_fixed_template.py
-
-   LM STUDIO / HF JINJA: logic inlined (no namespace-as-macro-arg).
+   FEATURES
+   --------
+   - Qwen XML tool calls: <tool_call>/<function=>/<parameter=>.
+   - Prompt-level thinking control: <|think_on|> and <|think_off|>,
+     usable in the first system/developer message or in the last user
+     message. Tokens in earlier user turns are rendered verbatim so the
+     prompt keeps the trained distribution; only the last turn steers
+     the generation.
+   - preserve_thinking kwarg; when omitted, all historical reasoning is
+     kept. When false, a last_query_index rolling checkpoint is applied.
+   - developer role accepted as an alias for system.
+   - Robust </think> variant handling and unclosed-think rescue.
+   - Tool-error detection and guidance injected into tool responses, plus a
+     consecutive-failure guard at the generation prompt. Detection is
+     anchored to the head of the payload, so log prose and source-code
+     snippets do not trigger false warnings.
+   - Fault tolerance for messy harness input: OpenAI tool envelopes, JSON
+     string tool arguments, multimodal content parts, malformed think tags.
+     JSON-string arguments are expanded into <parameter=...> blocks by a
+     built-in parser, so no runtime-specific from_json filter is needed.
+   - Historical assistant turns always carry a think block, matching
+     upstream byte for byte, even when the harness dropped the reasoning.
+   - Agent-friendly chat_template_kwargs defaults; upstream parity is
+     reachable by passing the official kwargs.
 ---------------------------------------------------------------------#}
 {%- set image_count = namespace(value=0) %}
 {%- set video_count = namespace(value=0) %}
@@ -82,7 +45,11 @@
         {{- content }}
     {%- elif content is iterable and content is not mapping %}
         {%- for item in content %}
-            {%- if 'image' in item or 'image_url' in item or item.type == 'image' %}
+            {%- if item is string %}
+                {{- item }}
+            {%- elif item is not mapping %}
+                {{- item | string }}
+            {%- elif item.type == 'image' or item.type == 'image_url' or 'image' in item or 'image_url' in item %}
                 {%- if is_system_content %}
                     {{- raise_exception('System message cannot contain images.') }}
                 {%- endif %}
@@ -93,7 +60,7 @@
                     {{- 'Picture ' ~ image_count.value ~ ': ' }}
                 {%- endif %}
                 {{- '<|vision_start|><|image_pad|><|vision_end|>' }}
-            {%- elif 'video' in item or item.type == 'video' %}
+            {%- elif item.type == 'video' or item.type == 'video_url' or 'video' in item or 'video_url' in item %}
                 {%- if is_system_content %}
                     {{- raise_exception('System message cannot contain videos.') }}
                 {%- endif %}
@@ -116,6 +83,253 @@
         {{- raise_exception('Unexpected content type.') }}
     {%- endif %}
 {%- endmacro %}
+{#- T-B: JSON-string tool arguments, parsed with pure Jinja.
+    The 'from_json' filter only exists in LM Studio; transformers/vLLM/SGLang
+    have no such filter, so depending on it crashes those runtimes.
+    Escape decoding is done inline: nested macro calls are rejected by the
+    restricted Jinja runtimes used by LM Studio and HF.
+    \uXXXX is decoded because json.dumps defaults to ensure_ascii=True, so
+    non-ASCII arguments (e.g. CJK paths) arrive escaped.
+    Only top-level object members are expanded. A member whose value is an
+    object or array is kept as raw JSON, matching the Qwen <parameter=...>
+    protocol, where the value is a single text blob. -#}
+{%- macro qwen_decode_nested_json(text) -%}
+    {%- set s = text -%}
+    {%- set ns = namespace(out='', in_str=false, esc=false, uni_buf='', uni_left=0, pending_hi=-1) -%}
+    {%- for ch in s -%}
+        {%- if ns.in_str -%}
+            {%- if ns.uni_left > 0 -%}
+                {%- set ns.uni_buf = ns.uni_buf ~ ch -%}
+                {%- set ns.uni_left = ns.uni_left - 1 -%}
+                {%- if ns.uni_left == 0 -%}
+                    {%- set _code = ns.uni_buf | int(base=16, default=63) -%}
+                    {%- if ns.pending_hi >= 55296 and ns.pending_hi <= 56319 -%}
+                        {%- set _cp = 65536 + (ns.pending_hi - 55296) * 1024 + (_code - 56320) -%}
+                        {%- set ns.out = ns.out ~ ('%c' | format(_cp)) -%}
+                        {%- set ns.pending_hi = -1 -%}
+                    {%- elif _code >= 55296 and _code <= 56319 -%}
+                        {%- set ns.pending_hi = _code -%}
+                    {%- elif _code >= 56320 and _code <= 57343 -%}
+                        {%- set ns.out = ns.out ~ '?' -%}
+                    {%- else -%}
+                        {#- tojson keeps C0 control characters escaped, so only
+                            printable and non-ASCII code points are decoded. -#}
+                        {%- if _code < 32 -%}
+                            {%- set ns.out = ns.out ~ '\\u' ~ ns.uni_buf -%}
+                        {%- else -%}
+                            {%- set ns.out = ns.out ~ ('%c' | format(_code)) -%}
+                        {%- endif -%}
+                    {%- endif -%}
+                    {%- set ns.uni_buf = '' -%}
+                {%- endif -%}
+            {%- elif ns.esc -%}
+                {%- if ch == 'u' -%}
+                    {%- set ns.uni_buf = '' -%}{%- set ns.uni_left = 4 -%}
+                {%- else -%}
+                    {%- if ns.pending_hi >= 55296 -%}
+                        {%- set ns.out = ns.out ~ '?' -%}
+                        {%- set ns.pending_hi = -1 -%}
+                    {%- endif -%}
+                    {#- keep the original two-character escape: only \\uXXXX
+                        is translated, the rest stay as the JSON escape forms
+                        that tojson(ensure_ascii=False) produces. -#}
+                    {%- set ns.out = ns.out ~ '\\' ~ ch -%}
+                {%- endif -%}
+                {%- set ns.esc = false -%}
+            {%- elif ch == '\\' -%}
+                {%- set ns.esc = true -%}
+            {%- elif ch == '"' -%}
+                {%- set ns.in_str = false -%}
+                {%- set ns.out = ns.out ~ '"' -%}
+            {%- else -%}
+                {%- set ns.out = ns.out ~ ch -%}
+            {%- endif -%}
+        {%- else -%}
+            {%- if ch == '"' -%}
+                {%- set ns.in_str = true -%}
+                {%- set ns.out = ns.out ~ '"' -%}
+            {%- else -%}
+                {%- set ns.out = ns.out ~ ch -%}
+            {%- endif -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {%- if ns.pending_hi >= 55296 -%}
+        {%- set ns.out = ns.out ~ '?' -%}
+    {%- endif -%}
+    {{- ns.out -}}
+{%- endmacro %}
+{%- macro render_json_object_params(text) -%}
+    {%- set ns_json.ok = false -%}
+    {%- set s = text | trim -%}
+    {%- set ns = namespace(state='start', key='', val='', depth=0, in_str=false, esc=false, uni_buf='', uni_left=0, pending_hi=-1, is_str=false, out=[]) -%}
+    {%- for ch in s -%}
+        {%- if ns.state == 'start' -%}
+            {%- if ch == '{' -%}
+                {%- set ns.state = 'key' -%}
+            {%- elif ch not in ' \t\r\n' -%}
+                {%- set ns.state = 'fail' -%}
+            {%- endif -%}
+        {%- elif ns.state == 'key' -%}
+            {%- if ch == '"' -%}
+                {%- set ns.key = '' -%}{%- set ns.esc = false -%}{%- set ns.uni_buf = '' -%}{%- set ns.uni_left = 0 -%}
+                {%- set ns.state = 'key_str' -%}
+            {%- elif ch == '}' -%}
+                {%- set ns.state = 'end' -%}
+            {%- elif ch not in ' \t\r\n' -%}
+                {%- set ns.state = 'fail' -%}
+            {%- endif -%}
+        {%- elif ns.state == 'sep' -%}
+            {%- if ch == '"' -%}
+                {%- set ns.key = '' -%}{%- set ns.esc = false -%}{%- set ns.uni_buf = '' -%}{%- set ns.uni_left = 0 -%}
+                {%- set ns.state = 'key_str' -%}
+            {%- elif ch == '}' -%}
+                {%- set ns.state = 'end' -%}
+            {%- elif ch not in ' \t\r\n,' -%}
+                {%- set ns.state = 'fail' -%}
+            {%- endif -%}
+            {%- elif ns.state == 'key_str' -%}
+            {%- if ns.uni_left > 0 -%}
+                {%- set ns.uni_buf = ns.uni_buf ~ ch -%}
+                {%- set ns.uni_left = ns.uni_left - 1 -%}
+                {%- if ns.uni_left == 0 -%}
+                    {%- set _code = ns.uni_buf | int(base=16, default=63) -%}
+                    {%- if ns.pending_hi >= 55296 and ns.pending_hi <= 56319 -%}
+                        {%- set _cp = 65536 + (ns.pending_hi - 55296) * 1024 + (_code - 56320) -%}
+                        {%- set ns.key = ns.key ~ ('%c' | format(_cp)) -%}
+                        {%- set ns.pending_hi = -1 -%}
+                    {%- elif _code >= 55296 and _code <= 56319 -%}
+                        {%- set ns.pending_hi = _code -%}
+                    {%- elif _code >= 56320 and _code <= 57343 -%}
+                        {%- set ns.key = ns.key ~ '�' -%}
+                    {%- else -%}
+                        {%- set ns.key = ns.key ~ ('%c' | format(_code)) -%}
+                    {%- endif -%}
+                    {%- set ns.uni_buf = '' -%}
+                {%- endif -%}
+            {%- elif ns.esc -%}
+                {%- if ch == 'u' -%}
+                    {%- set ns.uni_buf = '' -%}{%- set ns.uni_left = 4 -%}
+                {%- else -%}
+                    {%- if ns.pending_hi >= 55296 -%}
+                        {%- set ns.key = ns.key ~ '�' -%}
+                        {%- set ns.pending_hi = -1 -%}
+                    {%- endif -%}
+                    {%- if ch == 'n' -%}{%- set ns.key = ns.key ~ '\n' -%}
+                    {%- elif ch == 't' -%}{%- set ns.key = ns.key ~ '\t' -%}
+                    {%- elif ch == 'r' -%}{%- set ns.key = ns.key ~ '\r' -%}
+                    {%- elif ch == 'b' -%}{%- set ns.key = ns.key ~ '\x08' -%}
+                    {%- elif ch == 'f' -%}{%- set ns.key = ns.key ~ '\x0c' -%}
+                    {%- else -%}{%- set ns.key = ns.key ~ ch -%}
+                    {%- endif -%}
+                {%- endif -%}
+                {%- set ns.esc = false -%}
+            {%- elif ch == '\\' -%}
+                {%- set ns.esc = true -%}
+            {%- elif ch == '"' -%}
+                {%- set ns.state = 'colon' -%}
+            {%- else -%}
+                {%- set ns.key = ns.key ~ ch -%}
+            {%- endif -%}
+        {%- elif ns.state == 'colon' -%}
+            {%- if ch == ':' -%}
+                {%- set ns.state = 'value_start' -%}
+            {%- elif ch not in ' \t\r\n' -%}
+                {%- set ns.state = 'fail' -%}
+            {%- endif -%}
+        {%- elif ns.state == 'value_start' -%}
+            {%- if ch in ' \t\r\n' -%}
+            {%- elif ch == '"' -%}
+                {%- set ns.val = '' -%}{%- set ns.esc = false -%}{%- set ns.uni_buf = '' -%}{%- set ns.uni_left = 0 -%}
+                {%- set ns.is_str = true -%}{%- set ns.state = 'value_str' -%}
+            {%- else -%}
+                {%- set ns.val = ch -%}{%- set ns.depth = 0 -%}{%- set ns.in_str = false -%}
+                {%- set ns.esc = false -%}{%- set ns.is_str = false -%}{%- set ns.state = 'value_raw' -%}
+                {%- if ch == '{' or ch == '[' -%}
+                    {%- set ns.depth = 1 -%}
+                {%- endif -%}
+            {%- endif -%}
+        {%- elif ns.state == 'value_str' -%}
+            {%- if ns.uni_left > 0 -%}
+                {%- set ns.uni_buf = ns.uni_buf ~ ch -%}
+                {%- set ns.uni_left = ns.uni_left - 1 -%}
+                {%- if ns.uni_left == 0 -%}
+                    {%- set _code = ns.uni_buf | int(base=16, default=63) -%}
+                    {%- if ns.pending_hi >= 55296 and ns.pending_hi <= 56319 -%}
+                        {%- set _cp = 65536 + (ns.pending_hi - 55296) * 1024 + (_code - 56320) -%}
+                        {%- set ns.val = ns.val ~ ('%c' | format(_cp)) -%}
+                        {%- set ns.pending_hi = -1 -%}
+                    {%- elif _code >= 55296 and _code <= 56319 -%}
+                        {%- set ns.pending_hi = _code -%}
+                    {%- elif _code >= 56320 and _code <= 57343 -%}
+                        {%- set ns.val = ns.val ~ '�' -%}
+                    {%- else -%}
+                        {%- set ns.val = ns.val ~ ('%c' | format(_code)) -%}
+                    {%- endif -%}
+                    {%- set ns.uni_buf = '' -%}
+                {%- endif -%}
+            {%- elif ns.esc -%}
+                {%- if ch == 'u' -%}
+                    {%- set ns.uni_buf = '' -%}{%- set ns.uni_left = 4 -%}
+                {%- else -%}
+                    {%- if ns.pending_hi >= 55296 -%}
+                        {%- set ns.val = ns.val ~ '�' -%}
+                        {%- set ns.pending_hi = -1 -%}
+                    {%- endif -%}
+                    {%- if ch == 'n' -%}{%- set ns.val = ns.val ~ '\n' -%}
+                    {%- elif ch == 't' -%}{%- set ns.val = ns.val ~ '\t' -%}
+                    {%- elif ch == 'r' -%}{%- set ns.val = ns.val ~ '\r' -%}
+                    {%- elif ch == 'b' -%}{%- set ns.val = ns.val ~ '\x08' -%}
+                    {%- elif ch == 'f' -%}{%- set ns.val = ns.val ~ '\x0c' -%}
+                    {%- else -%}{%- set ns.val = ns.val ~ ch -%}
+                    {%- endif -%}
+                {%- endif -%}
+                {%- set ns.esc = false -%}
+            {%- elif ch == '\\' -%}
+                {%- set ns.esc = true -%}
+            {%- elif ch == '"' -%}
+                {%- set ns.out = ns.out + ['<parameter=' ~ ns.key ~ '>\n' ~ ns.val ~ '\n</parameter>\n'] -%}
+                {%- set ns.state = 'sep' -%}
+            {%- else -%}
+                {%- set ns.val = ns.val ~ ch -%}
+            {%- endif -%}
+        {%- elif ns.state == 'value_raw' -%}
+            {%- if ns.in_str -%}
+                {%- if ns.esc -%}
+                    {%- set ns.val = ns.val ~ ch -%}{%- set ns.esc = false -%}
+                {%- elif ch == '\\' -%}
+                    {%- set ns.val = ns.val ~ ch -%}{%- set ns.esc = true -%}
+                {%- elif ch == '"' -%}
+                    {%- set ns.in_str = false -%}{%- set ns.val = ns.val ~ ch -%}
+                {%- else -%}
+                    {%- set ns.val = ns.val ~ ch -%}
+                {%- endif -%}
+            {%- else -%}
+                {%- if ch == '"' -%}
+                    {%- set ns.in_str = true -%}{%- set ns.val = ns.val ~ ch -%}
+                {%- elif ch == '{' or ch == '[' -%}
+                    {%- set ns.depth = ns.depth + 1 -%}{%- set ns.val = ns.val ~ ch -%}
+                {%- elif ch == '}' or ch == ']' -%}
+                    {%- if ns.depth > 0 -%}
+                        {%- set ns.depth = ns.depth - 1 -%}{%- set ns.val = ns.val ~ ch -%}
+                    {%- else -%}
+                        {%- set ns.out = ns.out + ['<parameter=' ~ ns.key ~ '>\n' ~ qwen_decode_nested_json(ns.val | trim) ~ '\n</parameter>\n'] -%}
+                        {%- set ns.state = 'end' -%}
+                    {%- endif -%}
+                {%- elif ch == ',' and ns.depth == 0 -%}
+                    {%- set ns.out = ns.out + ['<parameter=' ~ ns.key ~ '>\n' ~ qwen_decode_nested_json(ns.val | trim) ~ '\n</parameter>\n'] -%}
+                    {%- set ns.state = 'sep' -%}
+                {%- else -%}
+                    {%- set ns.val = ns.val ~ ch -%}
+                {%- endif -%}
+            {%- endif -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {%- if ns.state == 'end' -%}
+        {%- set ns_json.ok = true -%}
+        {{- ns.out | join('') -}}
+    {%- endif -%}
+{%- endmacro %}
+{%- set ns_json = namespace(ok=false) %}
 {%- set ns_flags = namespace(enable_thinking=true, has_tools=false, last_tool_failed=false, consecutive_failures=0) %}
 {%- if enable_thinking is defined %}
     {%- set ns_flags.enable_thinking = enable_thinking %}
@@ -152,6 +366,27 @@
     {%- endif %}
     {%- set system_content = system_content | trim %}
 {%- endif %}
+{#- T-F: resolve the effective thinking state before the tool instructions
+    are rendered, so the instruction block matches what the model will
+    actually emit. Precedence: chat_template_kwargs -> first
+    system/developer message -> last user turn (same as the main loop). -#}
+{%- set ns_final = namespace(enable_thinking=ns_flags.enable_thinking) %}
+{%- for message in messages %}
+    {%- if message.role == "user" and loop.index0 == ns_query.last_query_index %}
+        {%- set scan = render_content(message.content, false)|trim %}
+        {%- if '<|think_off|>' in scan %}
+            {%- set ns_final.enable_thinking = false %}
+        {%- elif '<|think_on|>' in scan %}
+            {%- set ns_final.enable_thinking = true %}
+        {%- elif '<|think_xhigh|>' in scan or '<|think_high|>' in scan %}
+            {%- set ns_final.enable_thinking = true %}
+        {%- elif '<|think_low|>' in scan or '<|think_minimal|>' in scan %}
+            {%- set ns_final.enable_thinking = true %}
+        {%- elif '<|think_medium|>' in scan %}
+            {%- set ns_final.enable_thinking = true %}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
 {%- if tools and tools is iterable and tools is not mapping %}
     {%- set ns_flags.has_tools = true %}
     {{- '<|im_start|>system\n' }}
@@ -191,6 +426,35 @@ Reminder:
 - Never invent tool-specific XML wrappers or attributes such as <run_command>, <bash command="...">, or <function name="...">. Put each argument value inside its own <parameter=...>...</parameter> body exactly as shown above.
 - Never output <tool_response>, <|tool_response|>, <|tool_response|>response:..., or any tool result placeholder. Tool responses are inserted by the runtime after your tool call is executed.
 - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+</IMPORTANT>
+    {%- endset %}
+    {%- elif ns_final.enable_thinking is false %}
+    {%- set tool_instructions %}
+If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags.
+- Do NOT omit the opening <tool_call> tag. Every function call MUST be wrapped in a complete <tool_call>...</tool_call> block.
+- If you choose to call a tool, you MUST output the <tool_call> block IMMEDIATELY, with NO conversational text before it.
+- The <tool_call> and <function> tags MUST be at the very beginning of a new line, with NO spaces or indentation before them.
+- Never invent tool-specific XML wrappers or attributes such as <run_command>, <bash command="...">, or <function name="...">. Put each argument value inside its own <parameter=...>...</parameter> body exactly as shown above.
+- Never output <tool_response>, <|tool_response|>, <|tool_response|>response:..., or any tool result placeholder. Tool responses are inserted by the runtime after your tool call is executed.
+- To call multiple functions, output a separate, completely closed <tool_call></tool_call> block for EACH function. Do NOT nest <tool_call> blocks.
+- If you have gathered all necessary data and do not need to call a tool, answer the question like normal and provide your final response to the user.
 </IMPORTANT>
     {%- endset %}
     {%- else %}
@@ -244,12 +508,17 @@ Reminder:
             {{- raise_exception('System/developer message must be at the beginning.') }}
         {%- endif %}
     {%- elif message.role == "user" %}
-        {%- if '<|think_off|>' in content %}
-            {%- set ns_flags.enable_thinking = false %}
-            {%- set content = content | replace('<|think_off|>', '') | trim %}
-        {%- elif '<|think_on|>' in content %}
-            {%- set ns_flags.enable_thinking = true %}
-            {%- set content = content | replace('<|think_on|>', '') | trim %}
+        {#- T-D: only the last user turn carries think-control tokens.
+            Earlier user turns are rendered verbatim (token included) so the
+            prompt keeps the official distribution. -#}
+        {%- if loop.index0 == ns_query.last_query_index %}
+            {%- if '<|think_off|>' in content %}
+                {%- set ns_flags.enable_thinking = false %}
+                {%- set content = content | replace('<|think_off|>', '') | trim %}
+            {%- elif '<|think_on|>' in content %}
+                {%- set ns_flags.enable_thinking = true %}
+                {%- set content = content | replace('<|think_on|>', '') | trim %}
+            {%- endif %}
         {%- endif %}
         {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>\n' }}
         {%- set ns_flags.last_tool_failed = false %}
@@ -316,7 +585,7 @@ Reminder:
             {%- endif %}
         {%- endif %}
         {%- set show_think = false %}
-        {%- if reasoning_content and ns_flags.enable_thinking is not false %}
+        {%- if ns_flags.enable_thinking is not false %}
             {%- if preserve_thinking is not defined %}
                 {%- set show_think = true %}
             {%- elif preserve_thinking is true %}
@@ -328,9 +597,9 @@ Reminder:
         {%- set has_assistant_body = show_think or (content | trim | length > 0) %}
         {%- if show_think %}
             {%- if content %}
-                {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>\n' + content }}
+                {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>\n\n' + content }}
             {%- else %}
-                {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>' }}
+                {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>\n\n' }}
             {%- endif %}
         {%- else %}
             {%- if content %}
@@ -345,7 +614,7 @@ Reminder:
                     {%- set tool_call = tool_call.function %}
                 {%- endif %}
                 {%- if loop.first %}
-                    {%- if has_assistant_body %}
+                    {%- if content | trim %}
                         {{- '\n\n<tool_call>\n' }}
                     {%- else %}
                         {{- '<tool_call>\n' }}
@@ -365,16 +634,11 @@ Reminder:
                     {%- elif tool_call.arguments is string %}
                         {%- set trimmed_args = tool_call.arguments | trim %}
                         {%- if strict_tool_arguments is defined and strict_tool_arguments %}
-                            {{- raise_exception('tool_call.arguments must be a JSON object (mapping). Got a string. Deserialize once on ingest or set parse_string_arguments=true on runtimes that support from_json.') }}
+                            {{- raise_exception('tool_call.arguments must be a JSON object (mapping). Got a string. Deserialize once on ingest or set parse_string_arguments=true to expand JSON object strings.') }}
                         {%- elif parse_string_arguments is defined and parse_string_arguments and trimmed_args | length > 0 %}
-                            {%- set parsed_args = trimmed_args | from_json %}
-                            {%- if parsed_args is mapping %}
-                                {%- for args_name, args_value in parsed_args | items %}
-                                    {{- '<parameter=' ~ args_name ~ '>\n' }}
-                                    {%- set args_value = args_value | string if args_value is string else args_value | tojson %}
-                                    {{- args_value }}
-                                    {{- '\n</parameter>\n' }}
-                                {%- endfor %}
+                            {%- set rendered_params = render_json_object_params(trimmed_args) %}
+                            {%- if ns_json.ok %}
+                                {{- rendered_params }}
                             {%- else %}
                                 {{- trimmed_args }}
                                 {%- if not trimmed_args.endswith('\n') %}
@@ -396,15 +660,35 @@ Reminder:
     {%- elif message.role == "tool" %}
         {%- set content_lower = content | lower %}
         {%- if inject_tool_error_warnings is not defined or inject_tool_error_warnings is not false %}
-            {%- if content | length < 500
-                and '$ ' not in content
-                and 'took ' not in content_lower
-                and ('"error": true' in content_lower or '"error":true' in content_lower
-                     or '"error": "' in content_lower or '"error":"' in content_lower
-                     or '"status": "error"' in content_lower or '"status":"error"' in content_lower
-                     or 'exception:' in content_lower or 'traceback' in content_lower
-                     or 'command not found' in content_lower or 'invalid syntax' in content_lower
-                     or 'failed to' in content_lower) %}
+            {#- T-C: error detection is anchored to the head of the payload.
+                Scanning the whole body matched prose ("failed to build" in a
+                log line, "command not found" inside a source file) and
+                injected false "the tool call returned an error" warnings. -#}
+            {%- set head = content_lower[:200] %}
+            {%- set is_code = ('throw new ' in head or 'throw error' in head
+                or 'console.error' in head or 'logger.error' in head
+                or 'logging.error' in head) %}
+            {%- set error_field_null = ('"error": null' in head or '"error":null' in head
+                or '"error": false' in head or '"error":false' in head
+                or '"error": ""' in head or '"error":""' in head) %}
+            {%- set exit_ok = ('exit code: 0' in head or 'exited with code 0' in head) %}
+            {%- set json_error = (('"error":' in head and not error_field_null)
+                or '"status": "error"' in head or '"status":"error"' in head) %}
+            {%- set text_error = (head.startswith('exception:') or head.startswith('fatal:')
+                or head.startswith('error:') or head.startswith('err!')
+                or 'command not found' in head or 'invalid syntax' in head
+                or 'no such file or directory' in head or 'permission denied' in head
+                or 'is a directory' in head or 'is not a directory' in head or 'no such device' in head
+                or 'traceback (most recent call last)' in head
+                or (('exit code: ' in head or 'exited with code' in head) and not exit_ok)) %}
+            {%- set is_json_payload = (content | trim | length > 0
+                and (content | trim)[0] in ('{', '[')) %}
+            {%- if is_json_payload -%}
+                {%- set strong_error = json_error -%}
+            {%- else -%}
+                {%- set strong_error = text_error -%}
+            {%- endif -%}
+            {%- if not is_code and strong_error %}
                 {%- set ns_flags.last_tool_failed = true %}
                 {%- set ns_flags.consecutive_failures = ns_flags.consecutive_failures + 1 %}
             {%- else %}

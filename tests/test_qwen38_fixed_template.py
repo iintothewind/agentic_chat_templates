@@ -17,6 +17,8 @@ from test_qwen36_fixed_template import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+NL = '\n'  # newline inside assertion strings
 TEMPLATE_PATH = ROOT / "qwen38_fixed_template.jinja"
 Q36_PATH = ROOT / "qwen36_fixed_template.jinja"
 
@@ -322,6 +324,126 @@ class Qwen38FixedChatTemplateTests(unittest.TestCase):
         )
         self.assertIn("<|im_start|>system\nYou are a coder.<|im_end|>", out)
         self.assertNotIn("Reasoning effort is set to", out)
+
+    # --- T-A/T-B/T-C/T-D/T-E/T-F regressions ---
+
+    def test_multimodal_string_item_is_text_not_image(self):
+        out = render(
+            self.template,
+            messages=[{"role": "user", "content": ["an image of a cat"]}],
+        )
+        self.assertIn("an image of a cat", out)
+        self.assertNotIn("<|image_pad|>", out)
+
+    def test_multimodal_plain_string_item_does_not_raise(self):
+        out = render(
+            self.template,
+            messages=[{"role": "user", "content": ["hello world"]}],
+        )
+        self.assertIn("hello world", out)
+
+    def test_parse_string_arguments_without_from_json_filter(self):
+        out = render(
+            self.template,
+            parse_string_arguments=True,
+            messages=[
+                {"role": "user", "content": "run"},
+                assistant_tool_call("run", '{"cmd": "ls"}'),
+            ],
+        )
+        self.assertIn("<parameter=cmd>" + NL + "ls", out)
+
+    def test_tool_error_prose_does_not_trigger_warning(self):
+        out = render(
+            self.template,
+            messages=[
+                {"role": "user", "content": "check"},
+                {
+                    "role": "tool",
+                    "content": "OK: the previous release failed to build on CI, "
+                    "but current HEAD is green",
+                },
+            ],
+        )
+        self.assertNotIn("SYSTEM WARNING", out)
+
+    def test_real_tool_error_still_triggers_warning(self):
+        out = render(
+            self.template,
+            messages=[
+                {"role": "user", "content": "run"},
+                {"role": "tool", "content": '{"error": true, "msg": "boom"}'},
+            ],
+        )
+        self.assertIn("SYSTEM WARNING", out)
+
+    def test_historical_think_token_is_passed_through_verbatim(self):
+        out = render(
+            self.template,
+            messages=[
+                {"role": "user", "content": "<|think_off|>" + NL + "first"},
+                {"role": "assistant", "content": "a"},
+                {"role": "user", "content": "second"},
+            ],
+            add_generation_prompt=True,
+        )
+        self.assertIn("<|think_off|>", out)
+        self.assertTrue(out.endswith("<think>" + NL))
+
+    def test_last_user_turn_think_token_still_steers_generation(self):
+        out = render(
+            self.template,
+            messages=[
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "a"},
+                {"role": "user", "content": "<|think_off|>" + NL + "second"},
+            ],
+            add_generation_prompt=True,
+        )
+        self.assertNotIn("<|think_off|>", out)
+        self.assertIn("<think>" + NL + "</think>", out.split("assistant")[-1])
+
+    def test_tool_instructions_follow_thinking_state(self):
+        on = render(
+            self.template,
+            tools=[SEARCH_TOOL],
+            messages=[{"role": "user", "content": "go"}],
+        )
+        off = render(
+            self.template,
+            tools=[SEARCH_TOOL],
+            enable_thinking=False,
+            messages=[{"role": "user", "content": "go"}],
+        )
+        self.assertIn("<think>" + NL + "Brief explanation of tool call", on)
+        self.assertNotIn("<think>" + NL + "Brief explanation of tool call", off)
+        self.assertNotIn("MUST be placed strictly inside", off)
+        self.assertIn("MUST be placed strictly inside", on)
+
+    def test_assistant_turn_without_reasoning_keeps_think_block(self):
+        """T-E: upstream always emits the think block for a past turn."""
+        out = render(
+            self.template,
+            reasoning_effort="medium",
+            messages=[
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": "done"},
+            ],
+        )
+        self.assertIn("<think>" + NL + NL + "</think>", out)
+
+    def test_posix_shell_failure_triggers_warning(self):
+        out = render(
+            self.template,
+            messages=[
+                {"role": "user", "content": "read it"},
+                {
+                    "role": "tool",
+                    "content": "cat: README.md: No such file or directory",
+                },
+            ],
+        )
+        self.assertIn("SYSTEM WARNING", out)
 
 def main() -> int:
     loader = unittest.TestLoader()

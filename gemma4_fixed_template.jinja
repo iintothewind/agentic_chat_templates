@@ -14,182 +14,362 @@
    <|think|>, <|channel>thought, <|tool_call>call:name{...} DSL).
    Not intended for Gemma 2 / Gemma 3 (different chat protocols).
 
-   DESIGN PRINCIPLES
-   -----------------
-   1. Accuracy first — output must match Gemma 4 native turn/channel/tool
-      DSL as documented by Google (ai.google.dev/gemma).
-   2. Fault tolerance second — accept messy harness inputs (string
-      arguments, OpenAI tool envelope, multimodal content parts) and
-      render valid prompts; avoid silent corruption over blind fail-fast.
-   3. Agent smoothness — defaults tuned for multi-turn tool loops:
-      preserve historical <|channel>thought, inject tool-error guidance,
-      P5 continuation turns; kwargs can restore upstream parity.
-   4. Layered errors — crash only when prompt cannot be made valid;
-      warn/guide when tool calls fail; lenient fallback for wire-format
-      differences (OpenAI JSON-string arguments).
-
-   BASE
-   ----
-   Forked from gemma4_improved_template.jinja. All five improved-template
-   patches (P1–P5) are preserved unchanged in behaviour. P6 is an additive
-   prompt-level thinking-control layer, modelled after:
-     froggeric/Qwen-Fixed-Chat-Templates
-     https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates
-
-   COMPATIBILITY WITH gemma4_improved_template.jinja
-   -------------------------------------------------
-   When you do NOT insert <|think_on|> or <|think_off|> in any message,
-   and you do not hit the P6b consecutive-tool-error gen-prompt guard,
-   rendered output is byte-for-byte identical to gemma4_improved_template
-   on the same inputs (plain chat, system+tools, tool calls, P5
-   continuation turns, and enable_thinking=false + preserve_thinking=false
-   upstream-compat mode were verified).
-
-   chat_template_kwargs (enable_thinking, preserve_thinking) continue to
-   work exactly as in the improved template. P6 tokens are an optional
-   override layer on top — they never replace or break the kwargs path.
-
-   PATCH INVENTORY (inherited from gemma4_improved_template.jinja)
-   ---------------------------------------------------------------
-   P1  format_argument: emit JSON null instead of bare "None"
-       Fixes optional tool args (e.g. language=null) rendering as the
-       invalid literal "None" in Gemma 4 DSL.
-
-   P2  enable_thinking defaults to TRUE
-       Agentic harnesses often cannot pass chat_template_kwargs through
-       OpenAI-compatible SDKs; server-side default-on restores tool-call
-       accuracy without harness changes.
-
-   P3  tool_call.arguments: lenient string fallback (official parity) with
-       opt-in strict_tool_arguments raise and parse_string_arguments expand.
-
-   P4  preserve_thinking kwarg (default TRUE) keeps prior <|channel>thought
-       blocks in multi-turn tool loops. Upstream drops reasoning after the
-       last user turn, causing arguments:{} collapse on turn 3+.
-
-   P5  fix HF discussion #62 turn-tag close asymmetry
-       Suppresses spurious <turn|> closes when consecutive text-only
-       assistant messages continue the same model turn frame.
-
-   NEW IN THIS FILE (gemma4_fixed_template.jinja)
-   ----------------------------------------------
-   P6  Prompt-level thinking control via <|think_on|> and <|think_off|>
-       Insert either token anywhere in the first system/developer message
-       or in any user message. Tokens are harness directives only — they
-       are stripped before rendering and never reach the model tokenizer.
-
-       Priority chain (last wins across the conversation):
-         chat_template_kwargs.enable_thinking  (default true, from P2)
-           → first system/developer message tokens
-           → each subsequent user message token
-
-       Same-message precedence (matches Qwen-Fixed-Chat-Templates):
-         system/developer: <|think_on|> wins if both tokens appear
-         user messages:    <|think_off|> wins if both tokens appear
-
-       Effect on native Gemma tags (two separate layers, no collision):
-         - System turn: <|think|> injected only when thinking is ON at
-           system-render time (parsed from first system message before
-           injection).
-         - Generation prompt: when thinking is OFF, pre-fills an empty
-           <|channel>thought\n<channel|> block so the model skips reasoning;
-           when ON, opens <|turn>model\n without that pre-fill.
-
-       Gen-prompt state is read from ns_think.enable_thinking (not a
-       block-scoped copy) so think_off in the last user turn reliably
-       reaches the generation prompt under LM Studio / HF Jinja.
-
-   P6b Side-effect guards (modelled on Qwen-Fixed-Chat-Templates)
-       - Parse control tokens ONLY in system/developer + user text.
-         Tool payloads are never parsed (source code may contain the
-         strings literally).
-       - Strip control tokens from all rendered text; never re-parse them
-         from assistant reasoning/content round-trips (prevents feedback
-         loops when model output is fed back as history).
-       - Gate historical <|channel>thought re-emission on
-         ns_think.enable_thinking at the assistant turn being rendered.
-         Avoids channel/tag clash when a prior user turn disabled thinking.
-       - Enhanced strip_thinking: remove malformed/unclosed channel blocks,
-         leaked <|think|>, and any control tokens from assistant content.
-       - Consecutive tool errors (≥2): force empty <|channel>thought at
-         gen prompt to break bad reasoning loops (Qwen-Fixed guard).
-         Tool-error warnings are injected into <|tool_response> payloads
-         on the first failure; gen-prompt guard fires on ≥2 consecutive.
-         Does not affect improved-template output unless this guard fires.
-
-   P7  kwargs (agent-friendly defaults; opt out for upstream parity)
-       agent_defaults=true (default): P2 enable_thinking defaults ON.
-       strict_tool_arguments=false (default): string args raw-inserted
-         inside call:name{...} like official Gemma 4 upstream.
-       parse_string_arguments=false (default): when true + from_json
-         runtime, JSON strings expand to mapping key:value pairs.
-       inject_tool_error_warnings=true (default): P6b warning injection.
-       unwrap_tool_envelope=true (default): bare function specs accepted.
-
-   P8  Sync protocol fixes from official gemma4_26b_2607.jinja (2026-07-09)
-       Google canonical template: tool-calling loops, turn closures, and
-       thinking content-ordering. Agent defaults (P2/P4/P6/P7) unchanged.
-       - Gen-prompt after tool_response + thinking ON: open
-         <|channel>thought\n (no new <|turn>model), matching official
-         multi-turn tool loops. P6b consecutive-error guard still forces
-         an empty closed thought channel instead.
-       - continues_into_next: allow same model turn when tool_calls were
-         already paired with tool_responses (not tool_calls or ns_tr_out).
-       - Turn close: suppress <turn|> only when tool_response + empty
-         content + no following non-tool message (next_nt.found).
-       - Continuation detection: O(1) prev_non_tool_role (no backward scan).
-       - Multimodal parts: accept OpenAI image_url / input_audio aliases.
-       - Safer .get() for tool_calls / content. Intentionally NOT adopted:
-         official enable_thinking/preserve_thinking defaults (false),
-         narrow preserve_thinking∧tool_calls gate, or string-args raise.
-
-   UPSTREAM PARITY (chat_template_kwargs)
-   --------------------------------------
-     {"agent_defaults": false, "enable_thinking": false,
-      "preserve_thinking": false, "strict_tool_arguments": true,
-      "inject_tool_error_warnings": false}
-
-   preserve_thinking vs official Gemma 4 template
-   ----------------------------------------------
-     preserve_thinking=true (default)  →  keep all <|channel>thought blocks
-     preserve_thinking=false           →  only after last user turn
-                                          (plus tool_calls gate for upstream)
-
-   USAGE
-   -----
-   LM Studio:  My Models → model settings → Prompt Template → paste path
-   vLLM/SGLang: --chat-template /path/to/gemma4_fixed_template.jinja
-               --tool-call-parser gemma4 --reasoning-parser gemma4
-
-   Tests: python tests/test_gemma4_fixed_chat_template.py
-
-   LM STUDIO / HUGGINGFACE JINJA NOTES
-   -----------------------------------
-   Think-control logic is inlined in the template body (not passed into
-   macros via namespace arguments). Restricted Jinja runtimes used by LM
-   Studio and HF reject namespace-as-macro-arg and nested macro calls;
-   the inline form matches qwen36_fixed_template.jinja and avoids
-   "Missing positional argument" render errors.
-
-   THINKING CONTROL — QUICK EXAMPLES
-   ---------------------------------
-   Disable reasoning for one turn (no SDK changes):
-     {"role":"user","content":"<|think_off|>\nAnswer briefly."}
-
-   Re-enable after a prior think_off:
-     {"role":"user","content":"<|think_on|>\nNow explain step by step."}
-
-   Force off via kwargs (improved-template path, still works):
-     {"extra_body":{"chat_template_kwargs":{"enable_thinking":false}}}
+   FEATURES
+   --------
+   - Native Gemma 4 turn/channel/tool DSL as documented by Google
+     (ai.google.dev/gemma): <|turn>, <|channel>thought,
+     <|tool_call>call:name{...}.
+   - Prompt-level thinking control: <|think_on|> and <|think_off|>, usable
+     in the first system/developer message or in the last user message.
+     Tokens in earlier user turns are rendered verbatim so the prompt
+     keeps the trained distribution; only the last turn steers the
+     generation.
+   - enable_thinking defaults to TRUE (agent-friendly); upstream parity is
+     reachable by passing the official kwargs.
+   - preserve_thinking kwarg; when omitted, all historical
+     <|channel>thought blocks are kept. When false, only reasoning after the
+     last user turn is kept.
+   - Tool-error detection and guidance injected into tool responses, plus a
+     consecutive-failure guard at the generation prompt. Detection is
+     anchored to the head of the payload, so log prose and source-code
+     snippets do not trigger false warnings.
+   - Continuation turns: consecutive text-only assistant messages continue
+     the same model turn frame instead of closing it.
+   - Fault tolerance for messy harness input: OpenAI tool envelopes, JSON
+     string tool arguments, multimodal content parts (image_url,
+     input_audio), malformed think/channel tags.
+     JSON-string arguments are expanded by a built-in parser into the same
+     fragment the official template emits for a mapping, so no
+     runtime-specific from_json filter is needed.
+   - Optional tool args render as JSON null instead of the invalid literal
+     "None".
 
    PINS
    ----
    Upstream:  google/gemma-4-31B-it @ fcf2302760ae9c6e528a8dbba9dd636e56848237
    Protocol:  gemma4_26b_2607.jinja (Google canonical, 2026-07-09)
-   Base fork: gemma4_improved_template.jinja
-   License:   Apache 2.0 (same as upstream)
-
 ---------------------------------------------------------------------#}
+
+{#- G-B: JSON-string tool arguments, parsed with pure Jinja.
+
+    The 'from_json' filter only exists in LM Studio; transformers/vLLM/SGLang
+    have no such filter, so depending on it crashes those runtimes.
+
+    The renderer mirrors the official format_argument, so the output is
+    byte-identical to the official mapping path, nested structures included:
+
+        {"n": {"m": "deep"}}  ->  {n:{m:<|"|>deep<|"|>}}
+        {"n": [1, "x"]}       ->  {n:[1,<|"|>x<|"|>]}
+
+    Unicode escapes are decoded, because json.dumps defaults to
+    ensure_ascii=True, so non-ASCII arguments arrive escaped.
+
+    The scanners return their members as one string, members separated by
+    \x01 and key/value by \x00. Macros cannot return a dict or list, and
+    a macro-local list is emptied when a nested macro runs, so structured
+    data cannot be passed through locals here.
+-#}
+{%- macro g4_split_object(text) -%}
+    {%- set s = text | trim -%}
+    {%- set ns = namespace(state='start', key='', val='', depth=0, in_str=false, esc=false, out='') -%}
+    {%- for ch in s -%}
+        {%- if ns.state == 'start' -%}
+            {%- if ch == '{' -%}
+                {%- set ns.state = 'key' -%}
+            {%- elif ch not in ' \t\r\n' -%}
+                {%- set ns.state = 'fail' -%}
+            {%- endif -%}
+        {%- elif ns.state == 'key' -%}
+            {%- if ch == '"' -%}
+                {%- set ns.key = '' -%}{%- set ns.esc = false -%}{%- set ns.state = 'key_str' -%}
+            {%- elif ch == '}' -%}
+                {%- set ns.state = 'end' -%}
+            {%- elif ch not in ' \t\r\n' -%}
+                {%- set ns.state = 'fail' -%}
+            {%- endif -%}
+        {%- elif ns.state == 'sep' -%}
+            {%- if ch == '"' -%}
+                {%- set ns.key = '' -%}{%- set ns.esc = false -%}{%- set ns.state = 'key_str' -%}
+            {%- elif ch == '}' -%}
+                {%- set ns.state = 'end' -%}
+            {%- elif ch not in ' \t\r\n,' -%}
+                {%- set ns.state = 'fail' -%}
+            {%- endif -%}
+        {%- elif ns.state == 'key_str' -%}
+            {%- if ns.esc -%}
+                {%- set ns.key = ns.key ~ ch -%}{%- set ns.esc = false -%}
+            {%- elif ch == '\\' -%}
+                {%- set ns.esc = true -%}
+            {%- elif ch == '"' -%}
+                {%- set ns.state = 'colon' -%}
+            {%- else -%}
+                {%- set ns.key = ns.key ~ ch -%}
+            {%- endif -%}
+        {%- elif ns.state == 'colon' -%}
+            {%- if ch == ':' -%}
+                {%- set ns.state = 'value_start' -%}
+            {%- elif ch not in ' \t\r\n' -%}
+                {%- set ns.state = 'fail' -%}
+            {%- endif -%}
+        {%- elif ns.state == 'value_start' -%}
+            {%- if ch in ' \t\r\n' -%}
+            {%- elif ch == '"' -%}
+                {%- set ns.val = '"' -%}{%- set ns.esc = false -%}{%- set ns.state = 'value_str' -%}
+            {%- else -%}
+                {%- set ns.val = ch -%}{%- set ns.depth = 0 -%}{%- set ns.in_str = false -%}
+                {%- set ns.esc = false -%}{%- set ns.state = 'value_raw' -%}
+                {%- if ch == '{' or ch == '[' -%}
+                    {%- set ns.depth = 1 -%}
+                {%- endif -%}
+            {%- endif -%}
+        {%- elif ns.state == 'value_str' -%}
+            {%- if ns.esc -%}
+                {%- set ns.val = ns.val ~ ch -%}{%- set ns.esc = false -%}
+            {%- elif ch == '\\' -%}
+                {%- set ns.val = ns.val ~ ch -%}{%- set ns.esc = true -%}
+            {%- elif ch == '"' -%}
+                {%- set ns.val = ns.val ~ ch -%}
+                {%- set ns.out = ns.out ~ ns.key ~ '\x00' ~ ns.val ~ '\x01' -%}
+                {%- set ns.state = 'sep' -%}
+            {%- else -%}
+                {%- set ns.val = ns.val ~ ch -%}
+            {%- endif -%}
+        {%- elif ns.state == 'value_raw' -%}
+            {%- if ns.in_str -%}
+                {%- if ns.esc -%}
+                    {%- set ns.val = ns.val ~ ch -%}{%- set ns.esc = false -%}
+                {%- elif ch == '\\' -%}
+                    {%- set ns.val = ns.val ~ ch -%}{%- set ns.esc = true -%}
+                {%- elif ch == '"' -%}
+                    {%- set ns.in_str = false -%}{%- set ns.val = ns.val ~ ch -%}
+                {%- else -%}
+                    {%- set ns.val = ns.val ~ ch -%}
+                {%- endif -%}
+            {%- else -%}
+                {%- if ch == '"' -%}
+                    {%- set ns.in_str = true -%}{%- set ns.val = ns.val ~ ch -%}
+                {%- elif ch == '{' or ch == '[' -%}
+                    {%- set ns.depth = ns.depth + 1 -%}{%- set ns.val = ns.val ~ ch -%}
+                {%- elif ch == '}' or ch == ']' -%}
+                    {%- if ns.depth > 0 -%}
+                        {%- set ns.depth = ns.depth - 1 -%}{%- set ns.val = ns.val ~ ch -%}
+                    {%- else -%}
+                        {%- set ns.out = ns.out ~ ns.key ~ '\x00' ~ (ns.val | trim) ~ '\x01' -%}
+                        {%- set ns.state = 'end' -%}
+                    {%- endif -%}
+                {%- elif ch == ',' and ns.depth == 0 -%}
+                    {%- set ns.out = ns.out ~ ns.key ~ '\x00' ~ (ns.val | trim) ~ '\x01' -%}
+                    {%- set ns.state = 'sep' -%}
+                {%- else -%}
+                    {%- set ns.val = ns.val ~ ch -%}
+                {%- endif -%}
+            {%- endif -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {%- if ns.state == 'end' -%}
+        {{- '\x02' ~ ns.out -}}
+    {%- endif -%}
+{%- endmacro %}
+{%- macro g4_split_array(text) -%}
+    {%- set s = text | trim -%}
+    {%- set ns = namespace(state='start', val='', depth=0, in_str=false, esc=false, out='') -%}
+    {%- for ch in s -%}
+        {%- if ns.state == 'start' -%}
+            {%- if ch == '[' -%}
+                {%- set ns.state = 'value_start' -%}
+            {%- elif ch not in ' \t\r\n' -%}
+                {%- set ns.state = 'fail' -%}
+            {%- endif -%}
+        {%- elif ns.state == 'value_start' -%}
+            {%- if ch in ' \t\r\n' -%}
+            {%- elif ch == ']' -%}
+                {%- set ns.state = 'end' -%}
+            {%- elif ch == '"' -%}
+                {%- set ns.val = '"' -%}{%- set ns.esc = false -%}{%- set ns.state = 'value_str' -%}
+            {%- else -%}
+                {%- set ns.val = ch -%}{%- set ns.depth = 0 -%}{%- set ns.in_str = false -%}
+                {%- set ns.esc = false -%}{%- set ns.state = 'value_raw' -%}
+                {%- if ch == '{' or ch == '[' -%}
+                    {%- set ns.depth = 1 -%}
+                {%- endif -%}
+            {%- endif -%}
+        {%- elif ns.state == 'value_str' -%}
+            {%- if ns.esc -%}
+                {%- set ns.val = ns.val ~ ch -%}{%- set ns.esc = false -%}
+            {%- elif ch == '\\' -%}
+                {%- set ns.val = ns.val ~ ch -%}{%- set ns.esc = true -%}
+            {%- elif ch == '"' -%}
+                {%- set ns.val = ns.val ~ ch -%}
+                {%- set ns.out = ns.out ~ ns.val ~ '\x01' -%}
+                {%- set ns.state = 'sep' -%}
+            {%- else -%}
+                {%- set ns.val = ns.val ~ ch -%}
+            {%- endif -%}
+        {%- elif ns.state == 'value_raw' -%}
+            {%- if ns.in_str -%}
+                {%- if ns.esc -%}
+                    {%- set ns.val = ns.val ~ ch -%}{%- set ns.esc = false -%}
+                {%- elif ch == '\\' -%}
+                    {%- set ns.val = ns.val ~ ch -%}{%- set ns.esc = true -%}
+                {%- elif ch == '"' -%}
+                    {%- set ns.in_str = false -%}{%- set ns.val = ns.val ~ ch -%}
+                {%- else -%}
+                    {%- set ns.val = ns.val ~ ch -%}
+                {%- endif -%}
+            {%- else -%}
+                {%- if ch == '"' -%}
+                    {%- set ns.in_str = true -%}{%- set ns.val = ns.val ~ ch -%}
+                {%- elif ch == '{' or ch == '[' -%}
+                    {%- set ns.depth = ns.depth + 1 -%}{%- set ns.val = ns.val ~ ch -%}
+                {%- elif ch == '}' or ch == ']' -%}
+                    {%- if ns.depth > 0 -%}
+                        {%- set ns.depth = ns.depth - 1 -%}{%- set ns.val = ns.val ~ ch -%}
+                    {%- else -%}
+                        {%- set ns.out = ns.out ~ (ns.val | trim) ~ '\x01' -%}
+                        {%- set ns.state = 'end' -%}
+                    {%- endif -%}
+                {%- elif ch == ',' and ns.depth == 0 -%}
+                    {%- set ns.out = ns.out ~ (ns.val | trim) ~ '\x01' -%}
+                    {%- set ns.state = 'value_start' -%}
+                {%- else -%}
+                    {%- set ns.val = ns.val ~ ch -%}
+                {%- endif -%}
+            {%- endif -%}
+        {%- elif ns.state == 'sep' -%}
+            {%- if ch in ' \t\r\n' -%}
+            {%- elif ch == ',' -%}
+                {%- set ns.state = 'value_start' -%}
+            {%- elif ch == ']' -%}
+                {%- set ns.state = 'end' -%}
+            {%- else -%}
+                {%- set ns.state = 'fail' -%}
+            {%- endif -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {%- if ns.state == 'end' -%}
+        {{- '\x02' ~ ns.out -}}
+    {%- endif -%}
+{%- endmacro %}
+{%- macro g4_decode_string(literal) -%}
+    {%- set s = literal | trim -%}
+    {%- set ns = namespace(state='start', out='', esc=false, uni_buf='', uni_left=0, pending_hi=-1) -%}
+    {%- for ch in s -%}
+        {%- if ns.state == 'start' -%}
+            {%- if ch == '"' -%}
+                {%- set ns.state = 'body' -%}
+            {%- elif ch not in ' \t\r\n' -%}
+                {%- set ns.state = 'fail' -%}
+            {%- endif -%}
+        {%- elif ns.state == 'body' -%}
+            {%- if ns.uni_left > 0 -%}
+                {%- set ns.uni_buf = ns.uni_buf ~ ch -%}
+                {%- set ns.uni_left = ns.uni_left - 1 -%}
+                {%- if ns.uni_left == 0 -%}
+                    {%- set _code = ns.uni_buf | int(base=16, default=63) -%}
+                    {%- if ns.pending_hi >= 55296 and ns.pending_hi <= 56319 -%}
+                        {%- set _cp = 65536 + (ns.pending_hi - 55296) * 1024 + (_code - 56320) -%}
+                        {%- set ns.out = ns.out ~ ('%c' | format(_cp)) -%}
+                        {%- set ns.pending_hi = -1 -%}
+                    {%- elif _code >= 55296 and _code <= 56319 -%}
+                        {%- set ns.pending_hi = _code -%}
+                    {%- elif _code >= 56320 and _code <= 57343 -%}
+                        {%- set ns.out = ns.out ~ '?' -%}
+                    {%- else -%}
+                        {%- set ns.out = ns.out ~ ('%c' | format(_code)) -%}
+                    {%- endif -%}
+                    {%- set ns.uni_buf = '' -%}
+                {%- endif -%}
+            {%- elif ns.esc -%}
+                {%- if ch == 'u' -%}
+                    {%- set ns.uni_buf = '' -%}{%- set ns.uni_left = 4 -%}
+                {%- else -%}
+                    {%- if ns.pending_hi >= 55296 -%}
+                        {%- set ns.out = ns.out ~ '?' -%}
+                        {%- set ns.pending_hi = -1 -%}
+                    {%- endif -%}
+                    {%- if ch == 'n' -%}{%- set ns.out = ns.out ~ '\n' -%}
+                    {%- elif ch == 't' -%}{%- set ns.out = ns.out ~ '\t' -%}
+                    {%- elif ch == 'r' -%}{%- set ns.out = ns.out ~ '\r' -%}
+                    {%- elif ch == 'b' -%}{%- set ns.out = ns.out ~ '\x08' -%}
+                    {%- elif ch == 'f' -%}{%- set ns.out = ns.out ~ '\x0c' -%}
+                    {%- else -%}{%- set ns.out = ns.out ~ ch -%}
+                    {%- endif -%}
+                {%- endif -%}
+                {%- set ns.esc = false -%}
+            {%- elif ch == '\\' -%}
+                {%- set ns.esc = true -%}
+            {%- elif ch == '"' -%}
+                {%- set ns.state = 'done' -%}
+            {%- else -%}
+                {%- set ns.out = ns.out ~ ch -%}
+            {%- endif -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {%- if ns.state == 'done' -%}
+        {{- ns.out -}}
+    {%- else -%}
+        {{- s -}}
+    {%- endif -%}
+{%- endmacro %}
+{%- macro g4_render_value(text) -%}
+    {%- set s = text | trim -%}
+    {%- if s.startswith('"') -%}
+        {{- '<|"|>' ~ g4_decode_string(s) ~ '<|"|>' -}}
+    {%- elif s.startswith('{') -%}
+        {%- set members = g4_split_object(s) -%}
+        {%- if members.startswith('\x02') -%}
+            {%- set parts = members[1:].split('\x01') -%}
+            {%- set acc = namespace(s='', first=true) -%}
+            {%- for member in parts | sort -%}
+                {%- if member -%}
+                    {%- set kv = member.split('\x00') -%}
+                    {%- set acc.s = acc.s ~ ('' if acc.first else ',') ~ kv[0] ~ ':' ~ g4_render_value(kv[1]) -%}
+                    {%- set acc.first = false -%}
+                {%- endif -%}
+            {%- endfor -%}
+            {{- '{' ~ acc.s ~ '}' -}}
+        {%- else -%}
+            {{- '<|"|>' ~ s ~ '<|"|>' -}}
+        {%- endif -%}
+    {%- elif s.startswith('[') -%}
+        {%- set items = g4_split_array(s) -%}
+        {%- if items.startswith('\x02') -%}
+            {%- set parts = items[1:].split('\x01') -%}
+            {%- set acc = namespace(s='', first=true) -%}
+            {%- for item in parts -%}
+                {%- if item -%}
+                    {%- set acc.s = acc.s ~ ('' if acc.first else ',') ~ g4_render_value(item) -%}
+                    {%- set acc.first = false -%}
+                {%- endif -%}
+            {%- endfor -%}
+            {{- '[' ~ acc.s ~ ']' -}}
+        {%- else -%}
+            {{- '<|"|>' ~ s ~ '<|"|>' -}}
+        {%- endif -%}
+    {%- else -%}
+        {{- s -}}
+    {%- endif -%}
+{%- endmacro %}
+{%- macro g4_parse_json_object(text) -%}
+    {%- set s = text | trim -%}
+    {%- if s.startswith('{') -%}
+        {%- set members = g4_split_object(s) -%}
+        {%- if members.startswith('\x02') -%}
+            {%- set parts = members[1:].split('\x01') -%}
+            {%- set acc = namespace(s='', first=true) -%}
+            {%- for member in parts | sort -%}
+                {%- if member -%}
+                    {%- set kv = member.split('\x00') -%}
+                    {%- set acc.s = acc.s ~ ('' if acc.first else ',') ~ kv[0] ~ ':' ~ g4_render_value(kv[1]) -%}
+                    {%- set acc.first = false -%}
+                {%- endif -%}
+            {%- endfor -%}
+            {%- set ns_g4.out = acc.s -%}
+            {%- set ns_g4.ok = true -%}
+        {%- endif -%}
+    {%- endif -%}
+{%- endmacro %}
+{%- set ns_g4 = namespace(out='', ok=false) %}
 
 {%- macro format_parameters(properties, required, filter_keys=false) -%}
     {%- set standard_keys = ['description', 'type', 'properties', 'required', 'nullable'] -%}
@@ -394,15 +574,36 @@
     {%- set probe = tool_body | string -%}
     {%- set probe_lower = probe | lower -%}
     {%- set is_tool_error = false -%}
-    {%- if probe | length < 500
-        and '$ ' not in probe
-        and 'took ' not in probe_lower
-        and ('"error": true' in probe_lower or '"error":true' in probe_lower
-             or '"error": "' in probe_lower or '"error":"' in probe_lower
-             or '"status": "error"' in probe_lower or '"status":"error"' in probe_lower
-             or 'exception:' in probe_lower or 'traceback' in probe_lower
-             or 'command not found' in probe_lower or 'invalid syntax' in probe_lower
-             or 'failed to' in probe_lower) -%}
+    {#- G-C: error detection is anchored to the head of the payload.
+        Scanning the whole body matched prose ("failed to build" in a log
+        line, "command not found" inside a source file) and injected false
+        "the tool call returned an error" warnings. -#}
+    {%- set head = probe_lower[:200] -%}
+    {%- set is_code = ('throw new ' in head or 'throw error' in head
+        or 'console.error' in head or 'logger.error' in head
+        or 'logging.error' in head) -%}
+    {%- set error_field_null = ('"error": null' in head or '"error":null' in head
+        or '"error": false' in head or '"error":false' in head
+        or '"error": ""' in head or '"error":""' in head) -%}
+    {%- set exit_ok = ('exit code: 0' in head or 'exited with code 0' in head) -%}
+    {%- set json_error = (('"error":' in head and not error_field_null)
+        or '"status": "error"' in head or '"status":"error"' in head) -%}
+    {%- set text_error = (head.startswith('exception:') or head.startswith('fatal:')
+        or head.startswith('error:') or head.startswith('err!')
+        or 'command not found' in head or 'invalid syntax' in head
+        or 'no such file or directory' in head or 'permission denied' in head
+        or 'is a directory' in head or 'is not a directory' in head
+        or 'no such device' in head
+        or 'traceback (most recent call last)' in head
+        or (('exit code: ' in head or 'exited with code' in head) and not exit_ok)) -%}
+    {%- set is_json_payload = (probe | trim | length > 0
+        and (probe | trim)[0] in ('{', '[')) -%}
+    {%- if is_json_payload -%}
+        {%- set strong_error = json_error -%}
+    {%- else -%}
+        {%- set strong_error = text_error -%}
+    {%- endif -%}
+    {%- if not is_code and strong_error -%}
         {%- set is_tool_error = true -%}
         {%- set ns_toolfail.last_tool_failed = true -%}
         {%- set ns_toolfail.consecutive_failures = ns_toolfail.consecutive_failures + 1 -%}
@@ -564,18 +765,15 @@
                                 "gemma4_fixed_template: "
                                 "tool_calls[].function.arguments must be a JSON "
                                 "object (mapping). Got a string. Deserialize once "
-                                "on ingest, set parse_string_arguments=true on "
-                                "runtimes with from_json, or omit strict_tool_arguments."
+                                "on ingest, set parse_string_arguments=true to expand "
+                                "JSON object strings, or omit strict_tool_arguments."
                             ) -}}
                         {%- elif parse_string_arguments is defined and parse_string_arguments and arg_string | length > 0 -%}
-                            {%- set parsed_args = arg_string | from_json -%}
-                            {%- if parsed_args is mapping -%}
-                                {%- set ns_args = namespace(found_first=false) -%}
-                                {%- for key, value in parsed_args | dictsort -%}
-                                    {%- if ns_args.found_first %},{% endif -%}
-                                    {%- set ns_args.found_first = true -%}
-                                    {{- key -}}:{{- format_argument(value, escape_keys=False) -}}
-                                {%- endfor -%}
+                            {%- set ns_g4.out = '' -%}
+                            {%- set ns_g4.ok = false -%}
+                            {%- set _ = g4_parse_json_object(arg_string) -%}
+                            {%- if ns_g4.ok -%}
+                                {{- ns_g4.out -}}
                             {%- else -%}
                                 {{- arg_string -}}
                             {%- endif -%}
@@ -659,13 +857,19 @@
                     {{- strip_thinking(message['content']) -}}
                 {%- elif role == 'user' -%}
                     {%- set user_text = message['content'] -%}
-                    {%- if '<|think_off|>' in user_text -%}
-                        {%- set ns_think.enable_thinking = false -%}
-                        {%- set user_text = user_text | replace('<|think_off|>', '') | trim -%}
-                    {%- elif '<|think_on|>' in user_text -%}
-                        {%- set ns_think.enable_thinking = true -%}
-                        {%- set user_text = user_text | replace('<|think_on|>', '') | trim -%}
+                    {%- if loop.index0 == ns_turn.last_user_idx -%}
+                        {%- if '<|think_off|>' in user_text -%}
+                            {%- set ns_think.enable_thinking = false -%}
+                            {%- set user_text = user_text | replace('<|think_off|>', '') | trim -%}
+                        {%- elif '<|think_on|>' in user_text -%}
+                            {%- set ns_think.enable_thinking = true -%}
+                            {%- set user_text = user_text | replace('<|think_on|>', '') | trim -%}
+                        {%- else -%}
+                            {%- set user_text = user_text | trim -%}
+                        {%- endif -%}
                     {%- else -%}
+                        {#- G-D: earlier user turns pass through verbatim so the
+                            prompt keeps the trained distribution. -#}
                         {%- set user_text = user_text | trim -%}
                     {%- endif -%}
                     {%- set enable_thinking = ns_think.enable_thinking -%}
@@ -675,18 +879,47 @@
                 {%- endif -%}
             {%- elif message.get('content') is iterable -%}
                 {%- for item in message['content'] -%}
-                    {%- if item.get('type') == 'text' -%}
+                    {%- if item is string -%}
+                        {#- G-A: a plain string part is text. -#}
+                        {%- if role == 'model' -%}
+                            {{- strip_thinking(item) -}}
+                        {%- elif role == 'user' -%}
+                            {%- set user_text = item -%}
+                            {%- if loop.index0 == ns_turn.last_user_idx -%}
+                                {%- if '<|think_off|>' in user_text -%}
+                                    {%- set ns_think.enable_thinking = false -%}
+                                    {%- set user_text = user_text | replace('<|think_off|>', '') | trim -%}
+                                {%- elif '<|think_on|>' in user_text -%}
+                                    {%- set ns_think.enable_thinking = true -%}
+                                    {%- set user_text = user_text | replace('<|think_on|>', '') | trim -%}
+                                {%- else -%}
+                                    {%- set user_text = user_text | trim -%}
+                                {%- endif -%}
+                            {%- else -%}
+                                {%- set user_text = user_text | trim -%}
+                            {%- endif -%}
+                            {%- set enable_thinking = ns_think.enable_thinking -%}
+                            {{- user_text -}}
+                        {%- else -%}
+                            {{- item | trim -}}
+                        {%- endif -%}
+                    {%- elif item.get('type') == 'text' -%}
                         {%- if role == 'model' -%}
                             {{- strip_thinking(item['text']) -}}
                         {%- elif role == 'user' -%}
                             {%- set user_text = item['text'] -%}
-                            {%- if '<|think_off|>' in user_text -%}
-                                {%- set ns_think.enable_thinking = false -%}
-                                {%- set user_text = user_text | replace('<|think_off|>', '') | trim -%}
-                            {%- elif '<|think_on|>' in user_text -%}
-                                {%- set ns_think.enable_thinking = true -%}
-                                {%- set user_text = user_text | replace('<|think_on|>', '') | trim -%}
+                            {%- if loop.index0 == ns_turn.last_user_idx -%}
+                                {%- if '<|think_off|>' in user_text -%}
+                                    {%- set ns_think.enable_thinking = false -%}
+                                    {%- set user_text = user_text | replace('<|think_off|>', '') | trim -%}
+                                {%- elif '<|think_on|>' in user_text -%}
+                                    {%- set ns_think.enable_thinking = true -%}
+                                    {%- set user_text = user_text | replace('<|think_on|>', '') | trim -%}
+                                {%- else -%}
+                                    {%- set user_text = user_text | trim -%}
+                                {%- endif -%}
                             {%- else -%}
+                                {#- G-D: earlier user turns pass through verbatim. -#}
                                 {%- set user_text = user_text | trim -%}
                             {%- endif -%}
                             {%- set enable_thinking = ns_think.enable_thinking -%}
